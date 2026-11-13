@@ -1,185 +1,171 @@
-import yfinance as yf
-import pandas as pd
-import numpy as np
-import gymnasium as gym
-from gymnasium import spaces
-from stable_baselines3 import PPO
+"""
+Daily training/allocation run for the AI portfolio manager.
+
+Fixes applied vs. the original version (see project plan, Phase 0):
+  1. No more random fundamentals — real current snapshots from yfinance.
+  2. No lookahead — the model's observation for day t is lagged by one
+     day; it never sees the return it is being scored on until after it
+     commits to weights.
+  3. The final recommendation uses the most recent available day, not
+     day 0 of the training window.
+  4. The model is loaded and continued (not recreated from scratch) when
+     a saved model exists, and the saved file is only overwritten if the
+     new model backtests at least as well as the old one AND beats the
+     equal-weight baseline on a held-out slice.
+  5. The bond-floor rule lives in one function (portfolio_lib.apply_bond_floor),
+     used everywhere weights are computed.
+  6. yfinance end date now includes today.
+"""
+import json
+import os
 from datetime import datetime, timedelta
 
-# ==========================================
-# 1. BROAD MARKET & BOND UNIVERSE
-# ==========================================
-equity_tickers = [
-    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META',  # Tech/Comm
-    'JNJ', 'UNH', 'LLY',                      # Healthcare
-    'JPM', 'V', 'BAC',                        # Financials
-    'XOM', 'CVX',                             # Energy
-    'WMT', 'PG', 'KO'                         # Consumer Defensive
-]
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from stable_baselines3 import PPO
 
-bond_tickers = [
-    'AGG',  # US Aggregate Bond ETF
-    'TLT',  # Long Term Treasury
-    'SHV'   # Short Treasury / Cash Equivalent
-]
+from portfolio_lib import (
+    ALL_TICKERS, EQUITY_TICKERS, BOND_TICKERS, BOND_FLOOR,
+    build_features, make_lagged_observations, BroadMarketArena,
+    apply_bond_floor, softmax_weights, equal_weight_backtest, policy_backtest,
+)
 
-all_tickers = equity_tickers + bond_tickers
+MODEL_PATH = "graham_value_ai"
+MODEL_FILE = f"{MODEL_PATH}.zip"
+METADATA_PATH = "model_metadata.json"
+HOLDOUT_DAYS = 60  # last N days held out to validate before overwriting the saved model
 
-# Calculate dynamic 5-year rolling window
-end_date = datetime.today()
-start_date = end_date - timedelta(days=5*365)
-end_str = end_date.strftime('%Y-%m-%d')
-start_str = start_date.strftime('%Y-%m-%d')
 
-print(f"1. Fetching broad market data from {start_str} to {end_str}...")
-data = yf.download(all_tickers, start=start_str, end=end_str)['Close']
-returns = data.pct_change().dropna()
-n_days = len(returns)
+def fetch_fundamentals(tickers):
+    """
+    Pull a current fundamentals snapshot per ticker from yfinance.
 
-print("2. Engineering Fundamental Metrics across 19 Assets...")
-np.random.seed(42)
-feature_dfs = []
+    This is real data, not random noise, but it is a single point-in-time
+    snapshot broadcast across the whole training window (see
+    portfolio_lib.build_features docstring) — a known simplification until
+    Phase 1 adds point-in-time history from SEC EDGAR.
+    """
+    fundamentals = {}
+    for ticker in tickers:
+        try:
+            info = yf.Ticker(ticker).info
+        except Exception as e:
+            print(f"  Warning: could not fetch fundamentals for {ticker}: {e}")
+            info = {}
 
-for ticker in equity_tickers:
-    ret = returns[ticker].values
-    pe_ratio = np.clip(np.random.normal(20, 5, n_days), 5, 50)
-    price_to_intrinsic = np.clip(np.random.normal(1.0, 0.2, n_days), 0.5, 2.0)
-    div_yield = np.clip(np.random.normal(0.02, 0.01, n_days), 0.0, 0.06)
-    
-    ticker_df = pd.DataFrame({
-        f'{ticker}_ret': ret,
-        f'{ticker}_pe': pe_ratio,
-        f'{ticker}_p_to_iv': price_to_intrinsic,
-        f'{ticker}_div': div_yield
-    })
-    feature_dfs.append(ticker_df)
+        pe = info.get('trailingPE') or info.get('forwardPE') or 20.0
+        p_to_iv = info.get('priceToBook') or 1.0  # proxy for price-to-intrinsic-value
+        div = info.get('dividendYield') or 0.0
+        # yfinance has, at various versions, returned dividendYield as
+        # either a fraction (0.02) or a percentage (2.0) — normalize.
+        if div > 1.0:
+            div = div / 100.0
 
-for ticker in bond_tickers:
-    bond_df = pd.DataFrame({
-        f'{ticker}_ret': returns[ticker].values,
-        f'{ticker}_pe': np.zeros(n_days),      
-        f'{ticker}_p_to_iv': np.ones(n_days),  
-        f'{ticker}_div': np.ones(n_days) * 0.04 
-    })
-    feature_dfs.append(bond_df)
+        fundamentals[ticker] = {
+            'pe': float(np.clip(pe, 1.0, 100.0)),
+            'p_to_iv': float(np.clip(p_to_iv, 0.1, 10.0)),
+            'div': float(np.clip(div, 0.0, 0.15)),
+        }
+    return fundamentals
 
-full_features = pd.concat(feature_dfs, axis=1)
 
-# ==========================================
-# 2. THE CONSTRAINED ARENA
-# ==========================================
-class BroadMarketArena(gym.Env):
-    def __init__(self, feature_df, equity_tickers, bond_tickers):
-        super(BroadMarketArena, self).__init__()
-        self.feature_data = feature_df.values
-        self.all_tickers = equity_tickers + bond_tickers
-        self.n_assets = len(self.all_tickers)
-        self.n_steps = len(self.feature_data)
-        
-        self.equity_idx = list(range(len(equity_tickers)))
-        self.bond_idx = list(range(len(equity_tickers), self.n_assets))
-        
-        self.idx_ret = [feature_df.columns.get_loc(f"{t}_ret") for t in self.all_tickers]
-        self.idx_pe = [feature_df.columns.get_loc(f"{t}_pe") for t in self.all_tickers]
-        self.idx_p_to_iv = [feature_df.columns.get_loc(f"{t}_p_to_iv") for t in self.all_tickers]
-        self.idx_div = [feature_df.columns.get_loc(f"{t}_div") for t in self.all_tickers]
-        
-        self.action_space = spaces.Box(low=-1, high=1, shape=(self.n_assets,), dtype=np.float32)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.feature_data.shape[1],), dtype=np.float32)
+def fetch_prices(tickers, years=5):
+    end_date = datetime.today() + timedelta(days=1)  # yfinance end is exclusive; include today
+    start_date = end_date - timedelta(days=years * 365)
+    print(f"Fetching prices from {start_date:%Y-%m-%d} to {end_date:%Y-%m-%d}...")
+    data = yf.download(tickers, start=start_date, end=end_date, auto_adjust=True, progress=False)
+    return data['Close']
 
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        self.current_step = 0
-        obs = self.feature_data[self.current_step].astype(np.float32)
-        return obs, {}
 
-    def step(self, action):
-        exp_action = np.exp(action - np.max(action))
-        raw_weights = exp_action / np.sum(exp_action)
-        
-        total_bond_weight = np.sum(raw_weights[self.bond_idx])
-        total_equity_weight = np.sum(raw_weights[self.equity_idx])
-        
-        if total_bond_weight < 0.25:
-            bond_multiplier = 0.25 / total_bond_weight
-            equity_multiplier = 0.75 / total_equity_weight
-            
-            raw_weights[self.bond_idx] *= bond_multiplier
-            raw_weights[self.equity_idx] *= equity_multiplier
-            
-        final_weights = raw_weights
-        
-        daily_returns = self.feature_data[self.current_step, self.idx_ret]
-        pe_ratios = self.feature_data[self.current_step, self.idx_pe]
-        p_to_iv = self.feature_data[self.current_step, self.idx_p_to_iv]
-        div_yields = self.feature_data[self.current_step, self.idx_div]
-        
-        portfolio_return = np.sum(final_weights * daily_returns)
-        
-        graham_penalty = 0.0
-        dividend_bonus = 0.0
-        
-        for i in self.equity_idx:
-            weight = final_weights[i]
-            if weight > 0:
-                if pe_ratios[i] > 22.0:
-                    graham_penalty += (pe_ratios[i] - 22.0) * weight * 0.0005
-                if p_to_iv[i] > 1.0:
-                    graham_penalty += ((p_to_iv[i] - 1.0) ** 2) * weight * 0.01
-                dividend_bonus += div_yields[i] * weight * 0.0001
+def load_or_create_model(env):
+    if os.path.exists(MODEL_FILE):
+        print(f"Loading existing model from {MODEL_FILE} and continuing training...")
+        model = PPO.load(MODEL_PATH, env=env)
+        return model, True
+    print("No existing model found — creating a new one.")
+    model = PPO("MlpPolicy", env, verbose=0, learning_rate=0.0003)
+    return model, False
 
-        net_reward = (portfolio_return * 100) - graham_penalty + dividend_bonus
-        
-        self.current_step += 1
-        done = self.current_step >= self.n_steps - 1
-        obs = self.feature_data[self.current_step].astype(np.float32) if not done else np.zeros(self.observation_space.shape[0], dtype=np.float32)
-        
-        return obs, float(net_reward), done, False, {}
 
-# ==========================================
-# 3. TRAINING & ALLOCATION OUTPUT
-# ==========================================
-print("3. Initializing Broad Market Environment...")
-env = BroadMarketArena(full_features, equity_tickers, bond_tickers)
+def main():
+    print("1. Fetching real price and fundamentals data...")
+    price_close = fetch_prices(ALL_TICKERS)
+    fundamentals = fetch_fundamentals(ALL_TICKERS)
 
-print("4. Training AI across 19 assets with strict bond constraints...")
-model = PPO("MlpPolicy", env, verbose=0, learning_rate=0.0003)
-model.learn(total_timesteps=60000)
-print("Training Complete!")
+    print("2. Building features (real fundamentals, no synthetic noise)...")
+    full_features = build_features(price_close, fundamentals, ALL_TICKERS)
 
-# ==========================================
-# 4. SAVE THE TRAINED MODEL
-# ==========================================
-model.save("graham_value_ai")
-print("Model saved successfully as graham_value_ai.zip!")
+    print("3. Lagging observations by one day to remove lookahead...")
+    obs_df, reward_df = make_lagged_observations(full_features)
 
-# Generate final recommendation
-obs, _ = env.reset()
-action, _ = model.predict(obs)
+    split = max(len(obs_df) - HOLDOUT_DAYS, int(len(obs_df) * 0.8))
+    train_obs, train_reward = obs_df.iloc[:split], reward_df.iloc[:split]
+    holdout_obs, holdout_reward = obs_df.iloc[split:], reward_df.iloc[split:]
+    print(f"   Train: {len(train_obs)} days, Holdout: {len(holdout_obs)} days")
 
-exp_action = np.exp(action - np.max(action))
-raw_weights = exp_action / np.sum(exp_action)
+    env = BroadMarketArena(train_obs, train_reward, EQUITY_TICKERS, BOND_TICKERS)
 
-if np.sum(raw_weights[env.bond_idx]) < 0.25:
-    raw_weights[env.bond_idx] *= (0.25 / np.sum(raw_weights[env.bond_idx]))
-    raw_weights[env.equity_idx] *= (0.75 / np.sum(raw_weights[env.equity_idx]))
+    print("4. Loading/creating model and training...")
+    model, continued = load_or_create_model(env)
+    model.learn(total_timesteps=60000, reset_num_timesteps=not continued)
+    print("Training complete.")
 
-print("\n=== AI PORTFOLIO RECOMMENDATION ===")
-print(f"{'Asset':<10} | {'Type':<10} | {'Weight'}")
-print("-" * 35)
+    print("5. Validating on held-out data before saving...")
+    baseline_return = equal_weight_backtest(holdout_reward, ALL_TICKERS, EQUITY_TICKERS, BOND_TICKERS)
+    new_model_return = policy_backtest(model, holdout_obs, holdout_reward, EQUITY_TICKERS, BOND_TICKERS)
 
-total_eq = 0
-total_bd = 0
+    old_model_return = None
+    if continued and os.path.exists(METADATA_PATH):
+        with open(METADATA_PATH) as f:
+            old_meta = json.load(f)
+        old_model_return = old_meta.get("holdout_return")
 
-for i, ticker in enumerate(all_tickers):
-    weight = raw_weights[i]
-    if i in env.bond_idx:
-        total_bd += weight
-        print(f"{ticker:<10} | Bond       | {weight*100:05.2f}%")
+    print(f"   Equal-weight baseline holdout return: {baseline_return:.4%}")
+    print(f"   New model holdout return:              {new_model_return:.4%}")
+    if old_model_return is not None:
+        print(f"   Previously saved model holdout return: {old_model_return:.4%}")
+
+    beats_baseline = new_model_return > baseline_return
+    beats_old = old_model_return is None or new_model_return >= old_model_return
+
+    if beats_baseline and beats_old:
+        model.save(MODEL_PATH)
+        with open(METADATA_PATH, "w") as f:
+            json.dump({
+                "last_trained": datetime.today().strftime("%Y-%m-%d"),
+                "holdout_return": new_model_return,
+                "baseline_return": baseline_return,
+            }, f, indent=2)
+        print("Model IMPROVED or matched previous — saved.")
     else:
-        total_eq += weight
-        print(f"{ticker:<10} | Equity     | {weight*100:05.2f}%")
+        print("Model did NOT beat the baseline/previous model — not saved. Keeping prior model file.")
 
-print("-" * 35)
-print(f"TOTAL EQUITY: {total_eq*100:.2f}%")
-print(f"TOTAL BONDS:  {total_bd*100:.2f}%")
+    print("\n6. Generating today's recommendation from the most recent available day...")
+    latest_obs = obs_df.iloc[-1].values.astype(np.float32)
+    action, _ = model.predict(latest_obs, deterministic=True)
+    raw_weights = softmax_weights(action)
+
+    equity_idx = list(range(len(EQUITY_TICKERS)))
+    bond_idx = list(range(len(EQUITY_TICKERS), len(ALL_TICKERS)))
+    final_weights = apply_bond_floor(raw_weights, equity_idx, bond_idx, BOND_FLOOR)
+
+    print(f"\n=== AI PORTFOLIO RECOMMENDATION (as of {obs_df.index[-1].date()}) ===")
+    print(f"{'Asset':<10} | {'Type':<10} | {'Weight'}")
+    print("-" * 35)
+    total_eq, total_bd = 0.0, 0.0
+    for i, ticker in enumerate(ALL_TICKERS):
+        weight = final_weights[i]
+        if i in bond_idx:
+            total_bd += weight
+            print(f"{ticker:<10} | Bond       | {weight*100:05.2f}%")
+        else:
+            total_eq += weight
+            print(f"{ticker:<10} | Equity     | {weight*100:05.2f}%")
+    print("-" * 35)
+    print(f"TOTAL EQUITY: {total_eq*100:.2f}%")
+    print(f"TOTAL BONDS:  {total_bd*100:.2f}%")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,50 +1,57 @@
 name: Daily AI Portfolio Manager
 
 on:
-  # 1. SCHEDULE TRIGGER: Runs every weekday at 10:00 PM UTC
+  # Runs every weekday at 10:00 PM UTC
   schedule:
     - cron: '0 22 * * 1-5'
-  
-  # 2. DYNAMIC TRIGGER: Runs immediately whenever you push new code changes
-  push:
-    branches:
-      - main
-      
-  # 3. MANUAL TRIGGER: Allows you to click a "Run" button in the GitHub UI
+
+  # Manual trigger: click "Run workflow" in the GitHub UI
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   run-ai-agent:
     runs-on: ubuntu-latest
-    
+
     steps:
-      # Step 1: Download your code and the AI model from the repository
       - name: Checkout Repository
-        uses: actions/checkout@v3
-        
-      # Step 2: Install Python
+        uses: actions/checkout@v4
+
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          
-      # Step 3: Install the exact libraries defined in your requirements.txt
+
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          
-      # Step 4: Run the Python engine to train and allocate
+
       - name: Execute AI Engine
         run: python daily_updater.py
-        
-      # Step 5: Save the upgraded brain back to the repository
-      - name: Commit and Push Updated Model
+
+      - name: Commit updated metadata (not the model binary)
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add graham_value_ai.zip
-          
-          # Only commit if the model actually changed
-          git commit -m "Automated Daily Model Update" || echo "No changes to commit"
+          git add model_metadata.json
+          git commit -m "Daily model metadata update" || echo "No metadata changes to commit"
           git push
+
+      - name: Upload trained model as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: graham-value-ai-model
+          path: graham_value_ai.zip
+          retention-days: 90
+
+      - name: Publish model to the 'latest-model' release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-model
+          name: "Latest trained model"
+          body: "Automatically updated by the daily workflow. See model_metadata.json in the repo for the holdout backtest score that justified this save."
+          files: graham_value_ai.zip
