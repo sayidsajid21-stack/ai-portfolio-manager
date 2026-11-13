@@ -3,7 +3,8 @@ import pandas as pd
 import pytest
 
 from portfolio_lib import (
-    apply_bond_floor, apply_news_adjustment, build_features, make_lagged_observations,
+    apply_bond_floor, apply_news_adjustment, cap_single_asset_weight,
+    build_features, make_lagged_observations,
     equal_weight_backtest, policy_backtest, MOMENTUM_WINDOWS,
 )
 
@@ -226,3 +227,58 @@ def test_apply_news_adjustment_clips_out_of_range_sentiment():
     out_clipped = apply_news_adjustment(weights, equity_idx, ["AAA", "BBB"], news_sentiments={"AAA": 5.0})
     out_max = apply_news_adjustment(weights, equity_idx, ["AAA", "BBB"], news_sentiments={"AAA": 1.0})
     np.testing.assert_allclose(out_clipped, out_max)
+
+
+def test_cap_single_asset_weight_no_change_when_under_cap():
+    weights = np.array([0.3, 0.3, 0.3, 0.1])  # the 4th index is a bond, untouched anyway
+    idx_list = [0, 1, 2]
+    out = cap_single_asset_weight(weights, idx_list, max_weight=0.5)
+    np.testing.assert_allclose(out, weights)
+
+
+def test_cap_single_asset_weight_clips_and_redistributes():
+    # 5 equities (indices 0-4) summing to 0.90, so a 0.20 cap is feasible
+    # (max achievable is 5 * 0.20 = 1.0 >= 0.90); a bond at index 5 is
+    # outside idx_list and must stay untouched.
+    weights = np.array([0.70, 0.05, 0.05, 0.05, 0.05, 0.10])
+    idx_list = [0, 1, 2, 3, 4]
+    out = cap_single_asset_weight(weights, idx_list, max_weight=0.20)
+    assert out[0] == pytest.approx(0.20, abs=1e-6)
+    # excess (0.50) should be redistributed equally among indices 1-4,
+    # which started equal
+    assert out[1] == pytest.approx(out[2]) == pytest.approx(out[3]) == pytest.approx(out[4])
+    # sleeve total preserved exactly
+    assert out[idx_list].sum() == pytest.approx(0.90, abs=1e-6)
+    # bond weight (outside idx_list) completely untouched
+    assert out[5] == pytest.approx(0.10)
+
+
+def test_cap_single_asset_weight_handles_cascading_caps():
+    # Capping the biggest weight and redistributing its excess can push
+    # a second asset over the cap too — the function must keep iterating
+    # (and must not hand any more excess to an asset already clipped to
+    # exactly the cap) until everything in idx_list is at or under it.
+    # With 3 assets and cap 0.40, max achievable is 1.2 >= 1.0, feasible.
+    weights = np.array([0.80, 0.15, 0.05])
+    idx_list = [0, 1, 2]
+    out = cap_single_asset_weight(weights, idx_list, max_weight=0.40)
+    assert (out[idx_list] <= 0.40 + 1e-6).all()
+    assert out.sum() == pytest.approx(1.0, abs=1e-6)
+    # Hand-traced expected result: [0.40, 0.40, 0.20]
+    np.testing.assert_allclose(out, [0.40, 0.40, 0.20], atol=1e-6)
+
+
+def test_cap_single_asset_weight_preserves_sleeve_total_exactly():
+    rng = np.random.default_rng(3)
+    idx_list = list(range(5))  # last index (bond) excluded from the cap
+    # max_weight=0.25 with 5 assets is always feasible regardless of the
+    # draw (5 * 0.25 = 1.25 >= any possible sleeve total of <= 1.0), so
+    # the sleeve-total-preservation invariant always holds here — unlike
+    # the cascading-caps test above, which deliberately explores a case
+    # where a smaller cap is still feasible but requires iteration.
+    for _ in range(20):
+        raw = rng.dirichlet(np.ones(6))
+        out = cap_single_asset_weight(raw, idx_list, max_weight=0.25)
+        assert out[idx_list].sum() == pytest.approx(raw[idx_list].sum(), abs=1e-6)
+        assert out[5] == pytest.approx(raw[5])  # untouched
+        assert (out[idx_list] <= 0.25 + 1e-6).all()

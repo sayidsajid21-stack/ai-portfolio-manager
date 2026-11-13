@@ -127,6 +127,60 @@ def apply_news_adjustment(weights: np.ndarray, equity_idx, equity_tickers, news_
     return weights
 
 
+def cap_single_asset_weight(weights: np.ndarray, idx_list, max_weight: float = 0.10,
+                             max_iterations: int = 20) -> np.ndarray:
+    """
+    Enforce a hard per-asset concentration cap within a sleeve (e.g. no
+    single equity above 10% of the portfolio), redistributing any excess
+    proportionally among the other assets in `idx_list` that are still
+    under the cap. The total weight across `idx_list` is preserved
+    exactly — this only redistributes within the sleeve, never between
+    sleeves (so it never touches the equity/bond split `apply_bond_floor`
+    already set).
+
+    This is a defense-in-depth safety rule for live execution
+    (alpaca_execution.py): the RL model and the bond floor shouldn't
+    normally produce a >10% single-stock position, but this guarantees
+    it regardless of what the model outputs.
+
+    Redistributing excess from one over-cap asset can push another
+    asset over the cap too, so this repeats until nothing exceeds the
+    cap or `max_iterations` is reached (which would only happen if the
+    sleeve has so few assets that the cap is mathematically impossible
+    to satisfy — e.g. 5 assets and a cap below 20% each).
+    """
+    weights = weights.copy()
+    idx_array = np.array(idx_list)
+    # Once an asset is clipped to the cap, it must never receive any more
+    # redistributed excess in a later pass — otherwise it can bounce back
+    # above the cap (clipped to exactly max_weight, which isn't ">
+    # max_weight", so a naive re-check would treat it as "under cap" and
+    # hand it more). `at_cap` tracks this permanently across iterations.
+    at_cap = np.zeros(len(idx_array), dtype=bool)
+
+    for _ in range(max_iterations):
+        sleeve = weights[idx_array]
+        over_cap = (sleeve > max_weight) & ~at_cap
+        if not over_cap.any():
+            break
+
+        excess = (sleeve[over_cap] - max_weight).sum()
+        weights[idx_array[over_cap]] = max_weight
+        at_cap = at_cap | over_cap
+
+        receiving = ~at_cap
+        receiving_total = weights[idx_array][receiving].sum()
+        if receiving_total > 0:
+            weights[idx_array[receiving]] += excess * (weights[idx_array][receiving] / receiving_total)
+        else:
+            # Every asset in the sleeve is already at the cap — excess has
+            # nowhere to go (only reachable if the cap is infeasible for
+            # this sleeve's size, e.g. 5 assets and a cap below 20% each).
+            break
+
+    return weights
+
+
 def softmax_weights(action: np.ndarray) -> np.ndarray:
     exp_action = np.exp(action - np.max(action))
     return exp_action / np.sum(exp_action)
