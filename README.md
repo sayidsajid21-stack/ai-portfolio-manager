@@ -21,10 +21,13 @@ short-term noise.
 - `portfolio_lib.py` — feature engineering, the trading environment, and the
   bond-floor/turnover rules. Pure logic, no network calls — this is what's
   unit tested.
+- `edgar_fundamentals.py` — fetches point-in-time fundamentals (P/E,
+  price-to-book, dividend yield) for equities from SEC EDGAR's free XBRL
+  API. See "Point-in-time fundamentals" below.
 - `rebalance.py` — the monthly entry point: fetches data, trains, validates,
   saves, and prints the recommendation.
-- `tests/` — unit tests for `portfolio_lib.py` that run without network access
-  or GPU, using synthetic data.
+- `tests/` — unit tests that run without network access or GPU, using
+  synthetic data and a fake SEC response fixture.
 - `model_metadata.json` — small text file tracking when the model was last
   retrained and its holdout backtest score. Committed to git (unlike the
   model binary itself).
@@ -56,13 +59,37 @@ match a long-term orientation:
   so a model that happens to trade a lot doesn't look artificially better
   than it would after real-world costs.
 
+## Point-in-time fundamentals (Phase 1)
+
+Equities now get real point-in-time fundamentals history from SEC EDGAR's
+free XBRL company-facts API, via `edgar_fundamentals.py`, instead of a
+single current snapshot broadcast across the whole training history. Each
+historical date gets the P/E, price-to-book, and dividend yield that were
+actually knowable *on that date* — computed from each filing's `filed`
+date (when it became public), not its `end` date (the fiscal period it
+covers), so there's no lookahead.
+
+- **Setup**: SEC's Fair Access policy requires a descriptive User-Agent
+  with a contact email on every request. Set a repository variable named
+  `EDGAR_USER_AGENT` (Settings -> Secrets and variables -> Actions ->
+  Variables) to something like `"ai-portfolio-manager you@example.com"`.
+  It'll work with a generic placeholder if you skip this, but SEC asks
+  that you don't.
+- **Fallback**: bond ETFs have no SEC equity filings, so they always use
+  the Phase 0 constant-snapshot approach (via yfinance) — this is fine
+  since the bond-floor rule doesn't use fundamentals at all, and only
+  equities get the Graham-style P/E/intrinsic-value penalty. If EDGAR
+  lookup fails for a specific equity (rate limit, no CIK found, missing
+  tag), that ticker also falls back to the constant-snapshot approach
+  rather than failing the whole run.
+- **Known simplifications** (documented in `edgar_fundamentals.py`): EPS
+  uses the annual (10-K) figure only, updated once a year, rather than a
+  rolling trailing-twelve-month figure from quarterly 10-Qs; dividend
+  yield annualizes the most recently declared quarterly dividend (×4)
+  rather than summing the actual trailing four quarters.
+
 ## Known limitations (tracked, not yet fixed)
 
-- **Fundamentals are a single current snapshot, broadcast across the whole
-  training history.** yfinance only exposes today's P/E, price-to-book, and
-  dividend yield — not what those were on each past date. The model is
-  trained as if today's valuation always applied. The project plan's Phase 1
-  replaces this with real point-in-time fundamentals from SEC EDGAR.
 - **No news/sentiment input yet** (planned Phase 4).
 - **Recommendations only — no live or paper trading wired up** (planned
   Phase 6, via Alpaca's paper-trading API).

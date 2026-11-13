@@ -72,6 +72,32 @@ def test_build_features_uses_real_fundamentals_not_random():
     np.testing.assert_allclose(feats["AAA_ret"].values, expected_ret.loc[feats.index].values)
 
 
+def test_build_features_accepts_point_in_time_fundamentals_dataframe():
+    prices = _synthetic_prices(n_days=200)
+    # AAA gets real point-in-time fundamentals (a DataFrame, varying
+    # across dates); BBB gets the old constant-snapshot dict, to confirm
+    # build_features supports both modes side by side.
+    pit_fundamentals = pd.DataFrame({
+        "pe": np.linspace(15.0, 25.0, len(prices)),
+        "p_to_iv": np.linspace(0.8, 1.2, len(prices)),
+        "div": np.linspace(0.0, 0.03, len(prices)),
+    }, index=prices.index)
+    fundamentals = {
+        "AAA": pit_fundamentals,
+        "BBB": {"pe": 25.0, "p_to_iv": 1.1, "div": 0.0},
+    }
+    feats = build_features(prices, fundamentals, ["AAA", "BBB"])
+
+    # AAA's pe column should vary across rows (point-in-time), not be
+    # constant like the old broadcast behavior.
+    assert feats["AAA_pe"].nunique() > 1
+    # BBB's pe column should still be the old constant-broadcast behavior.
+    assert (feats["BBB_pe"] == 25.0).all()
+    # AAA's values should match the (reindexed) point-in-time series.
+    expected_aaa_pe = pit_fundamentals["pe"].reindex(feats.index)
+    np.testing.assert_allclose(feats["AAA_pe"].values, expected_aaa_pe.values)
+
+
 def test_build_features_includes_momentum_and_drops_insufficient_history():
     prices = _synthetic_prices(n_days=200)
     fundamentals = {"AAA": {}, "BBB": {}}

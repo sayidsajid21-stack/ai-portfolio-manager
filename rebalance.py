@@ -7,7 +7,7 @@ longer-horizon momentum features and a turnover penalty (both in
 portfolio_lib.py) that reward the model for holding positions rather than
 trading often.
 
-Fixes applied vs. the original version (see project plan, Phase 0):
+Fixes applied vs. the original version (Phase 0):
   1. No more random fundamentals — real current snapshots from yfinance.
   2. No lookahead — the model's observation for day t is lagged by one
      day; it never sees the return it is being scored on until after it
@@ -21,6 +21,11 @@ Fixes applied vs. the original version (see project plan, Phase 0):
   5. The bond-floor rule lives in one function (portfolio_lib.apply_bond_floor),
      used everywhere weights are computed.
   6. yfinance end date now includes today.
+
+Phase 1 addition: equity fundamentals now come from SEC EDGAR's
+point-in-time filing history (edgar_fundamentals.py) instead of a single
+current snapshot broadcast across all history. Set the EDGAR_USER_AGENT
+environment variable to your own contact email — see README.
 """
 import json
 import os
@@ -36,6 +41,7 @@ from portfolio_lib import (
     build_features, make_lagged_observations, BroadMarketArena,
     apply_bond_floor, softmax_weights, equal_weight_backtest, policy_backtest,
 )
+import edgar_fundamentals
 
 MODEL_PATH = "graham_value_ai"
 MODEL_FILE = f"{MODEL_PATH}.zip"
@@ -43,14 +49,14 @@ METADATA_PATH = "model_metadata.json"
 HOLDOUT_DAYS = 60  # last N days held out to validate before overwriting the saved model
 
 
-def fetch_fundamentals(tickers):
+def fetch_current_snapshot_fundamentals(tickers):
     """
-    Pull a current fundamentals snapshot per ticker from yfinance.
-
-    This is real data, not random noise, but it is a single point-in-time
-    snapshot broadcast across the whole training window (see
-    portfolio_lib.build_features docstring) — a known simplification until
-    Phase 1 adds point-in-time history from SEC EDGAR.
+    Pull a current fundamentals snapshot per ticker from yfinance. This is
+    the Phase 0 fallback: real data, not random noise, but a single
+    point-in-time snapshot broadcast across the whole training window
+    (see portfolio_lib.build_features docstring). Used for bond ETFs
+    (which have no SEC equity filings) and as a fallback if EDGAR lookup
+    fails for an equity.
     """
     fundamentals = {}
     for ticker in tickers:
@@ -76,6 +82,39 @@ def fetch_fundamentals(tickers):
     return fundamentals
 
 
+def fetch_fundamentals(equity_tickers, bond_tickers, price_close):
+    """
+    Build the fundamentals input for portfolio_lib.build_features.
+
+    Equities get real point-in-time fundamentals history from SEC EDGAR
+    (Phase 1) — the P/E and intrinsic-value ratio that actually applied
+    on each historical date, not today's value smeared backward. If
+    EDGAR lookup fails for a given ticker (rate limit, no CIK found,
+    missing tag, network issue), that ticker falls back to the Phase 0
+    constant-snapshot approach from yfinance rather than failing the
+    whole run.
+
+    Bond ETFs have no SEC equity filings (no EPS, no stockholders'
+    equity), so they always use the constant-snapshot fallback — which
+    is fine, since portfolio_lib.BroadMarketArena only applies the
+    Graham-style P/E and intrinsic-value penalty to equities anyway.
+    """
+    fundamentals = {}
+
+    for ticker in equity_tickers:
+        try:
+            raw = edgar_fundamentals.build_point_in_time_fundamentals(ticker, price_close.index)
+            fundamentals[ticker] = edgar_fundamentals.fundamentals_to_pe_iv_div(raw, price_close[ticker])
+            print(f"  {ticker}: point-in-time fundamentals from SEC EDGAR.")
+        except Exception as e:
+            print(f"  Warning: EDGAR fundamentals failed for {ticker} ({e}); "
+                  f"falling back to a current snapshot.")
+            fundamentals[ticker] = fetch_current_snapshot_fundamentals([ticker])[ticker]
+
+    fundamentals.update(fetch_current_snapshot_fundamentals(bond_tickers))
+    return fundamentals
+
+
 def fetch_prices(tickers, years=5):
     end_date = datetime.today() + timedelta(days=1)  # yfinance end is exclusive; include today
     start_date = end_date - timedelta(days=years * 365)
@@ -95,9 +134,9 @@ def load_or_create_model(env):
 
 
 def main():
-    print("1. Fetching real price and fundamentals data...")
+    print("1. Fetching prices, then point-in-time fundamentals from SEC EDGAR...")
     price_close = fetch_prices(ALL_TICKERS)
-    fundamentals = fetch_fundamentals(ALL_TICKERS)
+    fundamentals = fetch_fundamentals(EQUITY_TICKERS, BOND_TICKERS, price_close)
 
     print("2. Building features (real fundamentals, no synthetic noise)...")
     full_features = build_features(price_close, fundamentals, ALL_TICKERS)
