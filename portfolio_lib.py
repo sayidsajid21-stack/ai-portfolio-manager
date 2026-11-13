@@ -81,6 +81,37 @@ def apply_bond_floor(raw_weights: np.ndarray, equity_idx, bond_idx, floor: float
     return weights
 
 
+def _apply_equity_sleeve_multipliers(weights: np.ndarray, equity_idx, multipliers: np.ndarray) -> np.ndarray:
+    """
+    Shared helper: scale each equity's weight by its corresponding
+    multiplier, then renormalize the whole equity sleeve back to its
+    original total, leaving every weight outside `equity_idx` (bonds)
+    completely untouched. Used by apply_news_adjustment, apply_tilts,
+    and apply_exclusions so the three share one renormalization rule
+    instead of three slightly-different copies of it.
+    """
+    weights = weights.copy()
+    equity_weights = weights[equity_idx]
+    original_equity_total = equity_weights.sum()
+
+    adjusted = equity_weights * multipliers
+    adjusted_total = adjusted.sum()
+    if adjusted_total > 0:
+        # Rescale back to the original total so the equity/bond split is
+        # preserved exactly.
+        weights[equity_idx] = adjusted * (original_equity_total / adjusted_total)
+    else:
+        # Every equity weight is now ~0 (e.g. every equity excluded, or
+        # every equity already had ~0 weight) — there's nothing to
+        # rescale against, but `adjusted` (all zeros) is still the
+        # correct result and must be applied; the original weights must
+        # NOT be left in place, or a full exclusion would silently do
+        # nothing.
+        weights[equity_idx] = adjusted
+
+    return weights
+
+
 def apply_news_adjustment(weights: np.ndarray, equity_idx, equity_tickers, news_sentiments: dict,
                            max_adjustment_fraction: float = 0.03) -> np.ndarray:
     """
@@ -104,10 +135,6 @@ def apply_news_adjustment(weights: np.ndarray, equity_idx, equity_tickers, news_
     total (so the equity/bond split from apply_bond_floor is preserved
     exactly) before being recombined with the unchanged bond weights.
     """
-    weights = weights.copy()
-    equity_weights = weights[equity_idx]
-    original_equity_total = equity_weights.sum()
-
     multipliers = np.ones(len(equity_idx))
     for i, ticker in enumerate(equity_tickers):
         if ticker not in news_sentiments:
@@ -117,14 +144,54 @@ def apply_news_adjustment(weights: np.ndarray, equity_idx, equity_tickers, news_
         sentiment = float(np.clip(sentiment, -1.0, 1.0))
         multipliers[i] = 1.0 + sentiment * max_adjustment_fraction
 
-    adjusted = equity_weights * multipliers
-    adjusted_total = adjusted.sum()
-    if adjusted_total > 0:
-        weights[equity_idx] = adjusted * (original_equity_total / adjusted_total)
-    # else: every equity weight was already ~0 (degenerate); leave as-is
-    # rather than divide by zero.
+    return _apply_equity_sleeve_multipliers(weights, equity_idx, multipliers)
 
-    return weights
+
+def apply_tilts(weights: np.ndarray, equity_idx, equity_tickers, tilts: dict,
+                 max_tilt: float = 0.05) -> np.ndarray:
+    """
+    Apply a persistent, strategic per-ticker tilt proposed by the
+    strategy review agent (strategy_review.py, Phase 5) — distinct from
+    apply_news_adjustment's ephemeral day-to-day nudge: a tilt is a
+    deliberate, intentional lean on a ticker (e.g. "underweight this
+    sector") that stays in effect every month until the settings file is
+    changed again, not a one-off reaction to today's headlines.
+
+    `tilts` maps ticker -> a float, which SHOULD already be clipped to
+    [-max_tilt, max_tilt] by strategy_config.validate_and_clip before it
+    ever reaches here — this function clips again anyway as a second,
+    independent enforcement of the same hard limit, since this is the
+    function that actually moves money and shouldn't rely solely on a
+    proposal having been validated correctly somewhere upstream.
+    """
+    multipliers = np.ones(len(equity_idx))
+    for i, ticker in enumerate(equity_tickers):
+        if ticker not in tilts:
+            continue
+        tilt = float(np.clip(tilts[ticker], -max_tilt, max_tilt))
+        multipliers[i] = 1.0 + tilt
+
+    return _apply_equity_sleeve_multipliers(weights, equity_idx, multipliers)
+
+
+def apply_exclusions(weights: np.ndarray, equity_idx, equity_tickers, excluded_tickers) -> np.ndarray:
+    """
+    Zero out any ticker in `excluded_tickers` (a strategy review
+    decision — e.g. a legal/regulatory concern — not a tactical one) and
+    redistribute its weight proportionally among the remaining,
+    non-excluded equities, preserving the total equity sleeve weight
+    exactly. Bond weights are completely untouched.
+
+    If every equity ends up excluded (which strategy_config.validate_and_clip
+    should never allow through — see its MAX_EXCLUDED_TICKERS rule), the
+    equity sleeve collapses to all zeros rather than raising: the
+    resulting portfolio would just hold its bond weight and nothing
+    else, which is a safe (if strategically odd) degenerate case, not a
+    crash.
+    """
+    excluded_set = set(excluded_tickers)
+    multipliers = np.array([0.0 if ticker in excluded_set else 1.0 for ticker in equity_tickers])
+    return _apply_equity_sleeve_multipliers(weights, equity_idx, multipliers)
 
 
 def cap_single_asset_weight(weights: np.ndarray, idx_list, max_weight: float = 0.10,
@@ -288,12 +355,20 @@ class BroadMarketArena(gym.Env):
     TURNOVER_COST_RATE), so the trained policy favors holding positions
     over frequent rebalancing — this system is for long-term investing,
     not day trading.
+
+    `bond_floor` is configurable (default BOND_FLOOR) so the strategy
+    review agent (Phase 5) can propose a different equity/bond split
+    within its hard-coded allowed range, and have the model actually
+    trained under the floor it will be evaluated and executed with,
+    rather than training under one floor and only applying a different
+    one as a post-hoc adjustment on top.
     """
 
     def __init__(self, obs_df: pd.DataFrame, reward_df: pd.DataFrame, equity_tickers, bond_tickers,
-                 turnover_cost_rate: float = TURNOVER_COST_RATE):
+                 turnover_cost_rate: float = TURNOVER_COST_RATE, bond_floor: float = BOND_FLOOR):
         super().__init__()
         self.turnover_cost_rate = turnover_cost_rate
+        self.bond_floor = bond_floor
         assert len(obs_df) == len(reward_df)
         assert list(obs_df.columns) == list(reward_df.columns)
 
@@ -325,7 +400,7 @@ class BroadMarketArena(gym.Env):
 
     def step(self, action):
         raw_weights = softmax_weights(action)
-        final_weights = apply_bond_floor(raw_weights, self.equity_idx, self.bond_idx)
+        final_weights = apply_bond_floor(raw_weights, self.equity_idx, self.bond_idx, self.bond_floor)
 
         daily_returns = self.reward_data[self.current_step, self.idx_ret]
         pe_ratios = self.reward_data[self.current_step, self.idx_pe]

@@ -3,9 +3,9 @@ import pandas as pd
 import pytest
 
 from portfolio_lib import (
-    apply_bond_floor, apply_news_adjustment, cap_single_asset_weight,
-    build_features, make_lagged_observations,
-    equal_weight_backtest, policy_backtest, MOMENTUM_WINDOWS,
+    apply_bond_floor, apply_news_adjustment, apply_tilts, apply_exclusions,
+    cap_single_asset_weight, build_features, make_lagged_observations,
+    equal_weight_backtest, policy_backtest, MOMENTUM_WINDOWS, BroadMarketArena,
 )
 
 
@@ -282,3 +282,83 @@ def test_cap_single_asset_weight_preserves_sleeve_total_exactly():
         assert out[idx_list].sum() == pytest.approx(raw[idx_list].sum(), abs=1e-6)
         assert out[5] == pytest.approx(raw[5])  # untouched
         assert (out[idx_list] <= 0.25 + 1e-6).all()
+
+
+def test_apply_tilts_no_change_without_tilts():
+    equity_idx = [0, 1]
+    weights = np.array([0.4, 0.4, 0.2])
+    out = apply_tilts(weights, equity_idx, ["AAA", "BBB"], tilts={})
+    np.testing.assert_allclose(out, weights)
+
+
+def test_apply_tilts_boosts_positive_tilt_ticker():
+    equity_idx = [0, 1]
+    weights = np.array([0.4, 0.4, 0.2])
+    out = apply_tilts(weights, equity_idx, ["AAA", "BBB"], tilts={"AAA": 0.05})
+    assert out[0] > out[1]
+    assert out[2] == pytest.approx(0.2)  # bond untouched
+    assert out[0] + out[1] == pytest.approx(0.8, abs=1e-9)  # equity total preserved
+
+
+def test_apply_tilts_clips_to_max_tilt():
+    equity_idx = [0, 1]
+    weights = np.array([0.4, 0.4, 0.2])
+    out_clipped = apply_tilts(weights, equity_idx, ["AAA", "BBB"], tilts={"AAA": 10.0}, max_tilt=0.05)
+    out_max = apply_tilts(weights, equity_idx, ["AAA", "BBB"], tilts={"AAA": 0.05}, max_tilt=0.05)
+    np.testing.assert_allclose(out_clipped, out_max)
+
+
+def test_apply_tilts_clips_negative_tilt_too():
+    equity_idx = [0, 1]
+    weights = np.array([0.4, 0.4, 0.2])
+    out_clipped = apply_tilts(weights, equity_idx, ["AAA", "BBB"], tilts={"AAA": -10.0}, max_tilt=0.05)
+    out_min = apply_tilts(weights, equity_idx, ["AAA", "BBB"], tilts={"AAA": -0.05}, max_tilt=0.05)
+    np.testing.assert_allclose(out_clipped, out_min)
+
+
+def test_apply_exclusions_zeroes_and_redistributes():
+    equity_idx = [0, 1, 2]
+    weights = np.array([0.3, 0.3, 0.3, 0.1])  # bond at index 3
+    out = apply_exclusions(weights, equity_idx, ["AAA", "BBB", "CCC"], excluded_tickers=["BBB"])
+    assert out[1] == pytest.approx(0.0)
+    # remaining equities (AAA, CCC) split the full 0.9 equally since they started equal
+    assert out[0] == pytest.approx(out[2])
+    assert out[0] + out[2] == pytest.approx(0.9, abs=1e-9)
+    assert out[3] == pytest.approx(0.1)  # bond untouched
+
+
+def test_apply_exclusions_no_change_when_nothing_excluded():
+    equity_idx = [0, 1]
+    weights = np.array([0.4, 0.4, 0.2])
+    out = apply_exclusions(weights, equity_idx, ["AAA", "BBB"], excluded_tickers=[])
+    np.testing.assert_allclose(out, weights)
+
+
+def test_apply_exclusions_handles_excluding_everything_without_crashing():
+    equity_idx = [0, 1]
+    weights = np.array([0.4, 0.4, 0.2])
+    out = apply_exclusions(weights, equity_idx, ["AAA", "BBB"], excluded_tickers=["AAA", "BBB"])
+    assert out[0] == pytest.approx(0.0)
+    assert out[1] == pytest.approx(0.0)
+    assert out[2] == pytest.approx(0.2)  # bond untouched
+
+
+def test_broad_market_arena_respects_configurable_bond_floor():
+    dates = pd.date_range("2024-01-01", periods=5, freq="D")
+    cols = {}
+    for t in ["EQ1", "EQ2"]:
+        cols[f"{t}_ret"] = np.full(5, 0.01)
+        cols[f"{t}_pe"] = np.full(5, 20.0)
+        cols[f"{t}_p_to_iv"] = np.full(5, 1.0)
+        cols[f"{t}_div"] = np.full(5, 0.0)
+    cols["BD1_ret"] = np.full(5, 0.001)
+    cols["BD1_pe"] = np.full(5, 0.0)
+    cols["BD1_p_to_iv"] = np.full(5, 1.0)
+    cols["BD1_div"] = np.full(5, 0.04)
+    df = pd.DataFrame(cols, index=dates)
+
+    env = BroadMarketArena(df, df, ["EQ1", "EQ2"], ["BD1"], bond_floor=0.40)
+    obs, _ = env.reset()
+    action = np.array([1.0, 1.0, -1.0], dtype=np.float32)  # heavily favors equities
+    obs, reward, done, truncated, info = env.step(action)
+    assert info["weights"][2] == pytest.approx(0.40, abs=1e-6)

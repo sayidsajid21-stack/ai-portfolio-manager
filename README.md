@@ -17,6 +17,10 @@ trading orders.
   each month (or on demand via "Run workflow"): fetches data,
   trains/updates the model, validates it on held-out data, and prints a
   recommendation.
+- `.github/workflows/strategy_review.yml` runs at 21:00 UTC on the 15th
+  of each month: asks Claude to review the strategy's own settings and
+  opens a pull request if it proposes (and the hard limits allow) a
+  real change. See "Strategy review agent" below.
 - `.github/workflows/ci.yml` runs the unit tests on every push/PR — it does
   **not** retrain the model.
 
@@ -45,15 +49,28 @@ trading orders.
 - `report_lib.py` — builds the Markdown report from structured inputs
   (weights, news scores, performance, orders). Pure string-building
   logic, no file I/O — unit tested. See "Monthly reports" below.
-- `rebalance.py` — the monthly entry point: fetches data, trains, validates,
-  saves, checks news sentiment, enforces the concentration cap, executes
-  (or dry-runs) the paper trade, and writes the report.
+- `strategy_config.py` — the strategy settings schema, hard limits, and
+  validation/clipping logic. See "Strategy review agent" below.
+- `strategy_review.py` — asks Claude to propose a strategy settings
+  change, validates it, logs the rationale, and (if changed) writes
+  `strategy_settings.json` — never applies a change directly.
+- `rebalance.py` — the monthly entry point: loads strategy settings,
+  fetches data, trains, validates, saves, checks news sentiment,
+  enforces the concentration cap, executes (or dry-runs) the paper
+  trade, and writes the report.
 - `tests/` — unit tests that run without network access or GPU, using
   synthetic data and a fake SEC response fixture.
 - `reports/` — one Markdown report per run (`{date}.md`) plus `latest.md`.
   Committed to git.
 - `last_recommendation.json` — last month's final weights, used to show
   what changed in the next report. Committed to git.
+- `strategy_settings.json` — the equity/bond split, per-ticker tilts,
+  excluded tickers, and risk level currently in effect. Committed to
+  git; only ever changed via a strategy-review pull request, never
+  directly by the monthly rebalance.
+- `strategy_review_log.jsonl` — append-only log of every strategy
+  review run (proposal, corrections applied, rationale, whether
+  anything changed). Committed to git.
 - `model_metadata.json` — small text file tracking when the model was last
   retrained and its holdout backtest score. Committed to git (unlike the
   model binary itself).
@@ -236,6 +253,49 @@ Each report covers:
 5. **Paper trading orders** — what was (or would be) submitted to Alpaca
    (empty if Phase 6 isn't configured).
 
+## Strategy review agent (Phase 5)
+
+`strategy_review.py` periodically asks Claude to review the strategy's
+own settings — not individual stock weights, which the RL model already
+handles — against recent performance (`model_metadata.json`) and news
+(`news_log.jsonl`), and propose a change if one is warranted.
+
+- **What it can propose, and the hard limits on each** (enforced in
+  `strategy_config.py`, not just requested of the model):
+  - **Equity share** — between 50% and 85% (i.e. bonds between 15% and
+    50%). A proposal outside this range is clipped to the nearest
+    allowed value, not rejected outright.
+  - **Per-ticker strategic tilts** — up to ±5% per equity, persistent
+    across months until changed again. This is deliberately different
+    from Phase 4's news overlay: a tilt is "lean toward/away from this
+    sector/stock for a real, lasting reason," not a reaction to today's
+    headlines. A tilt beyond ±5%, or for an unknown ticker, is clipped
+    or dropped.
+  - **Excluded tickers** — fully removed from the portfolio (e.g. a
+    serious legal, regulatory, or going-concern concern). At most half
+    of the equity universe can be excluded at once, so a single review
+    can never collapse the whole portfolio down to just bonds.
+  - **Risk level** — one of `conservative`/`balanced`/`aggressive`
+    (currently informational/logged, not yet wired into the model's
+    behavior beyond what equity_share and the tilts already express).
+- **Never applied automatically.** The workflow opens a pull request
+  with the proposed `strategy_settings.json` change — the monthly
+  rebalance only ever reads whatever is currently merged into `main`.
+- **Cost**: one Claude API call per review (roughly monthly) — similar
+  order of magnitude to the Phase 4 news overlay. Reuses the same
+  `ANTHROPIC_API_KEY` secret; no additional credential needed. A no-op
+  if that secret isn't set.
+- **Every review is logged** to `strategy_review_log.jsonl` — including
+  reviews that propose no change, and the exact corrections applied to
+  any proposal that violated a hard limit — for a transparent history
+  of what was asked for versus what was actually allowed.
+- **Training follows the configured equity share.** `BroadMarketArena`'s
+  `bond_floor` is no longer a fixed constant — `rebalance.py` passes in
+  `1 - equity_share` from the current settings, so the model is trained
+  under the same floor it will actually be evaluated and executed with,
+  rather than training under one floor and only correcting toward a
+  different one as a post-hoc adjustment.
+
 ## Known limitations (tracked, not yet fixed)
 
 - **No portfolio-level drawdown circuit breaker.** The original project
@@ -250,6 +310,10 @@ Each report covers:
   has no path that goes from paper trading to live trading on its own,
   and shouldn't get one without deliberately choosing to build it after
   reviewing enough paper-trading history.
+- **`risk_level` is currently informational only.** The strategy review
+  agent can propose and log a risk level, but nothing in the pipeline
+  yet changes behavior based on it beyond what `equity_share` and the
+  per-ticker tilts already express.
 
 ## Fixed in this round (Phase 0)
 

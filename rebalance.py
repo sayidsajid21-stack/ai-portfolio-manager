@@ -46,6 +46,14 @@ reports/{date}.md and reports/latest.md on every run, covering the
 recommended allocation, what changed since last_recommendation.json's
 saved weights, any news adjustments, performance vs. the baseline, and
 the paper trading orders. No configuration needed — this always runs.
+
+Phase 5 addition: strategy_settings.json (strategy_config.py) controls
+the equity/bond split (within a hard-coded [50%, 85%] equity range),
+per-ticker strategic tilts (up to ±5%, persistent across months — unlike
+Phase 4's ephemeral news nudge), and excluded tickers. These are read
+here on every run; strategy_review.py proposes changes to them, always
+subject to strategy_config.validate_and_clip's hard limits, and never
+applies a change directly — see that module's docstring.
 """
 import json
 import os
@@ -57,15 +65,16 @@ import yfinance as yf
 from stable_baselines3 import PPO
 
 from portfolio_lib import (
-    ALL_TICKERS, EQUITY_TICKERS, BOND_TICKERS, BOND_FLOOR,
+    ALL_TICKERS, EQUITY_TICKERS, BOND_TICKERS,
     build_features, make_lagged_observations, BroadMarketArena,
-    apply_bond_floor, apply_news_adjustment, cap_single_asset_weight,
-    softmax_weights, equal_weight_backtest, policy_backtest,
+    apply_bond_floor, apply_news_adjustment, apply_tilts, apply_exclusions,
+    cap_single_asset_weight, softmax_weights, equal_weight_backtest, policy_backtest,
 )
 import edgar_fundamentals
 import news_sentiment
 import alpaca_execution
 import report_lib
+import strategy_config
 
 MAX_SINGLE_EQUITY_WEIGHT = 0.10
 
@@ -162,6 +171,13 @@ def load_or_create_model(env):
 
 
 def main():
+    print("0. Loading strategy settings (defaults if no review has run yet)...")
+    settings = strategy_config.load_settings()
+    bond_floor = 1.0 - settings["equity_share"]
+    print(f"   equity_share={settings['equity_share']:.0%}  risk_level={settings['risk_level']}  "
+          f"excluded={settings['excluded_tickers'] or 'none'}  "
+          f"tilts={settings['per_ticker_tilts'] or 'none'}")
+
     print("1. Fetching prices, then point-in-time fundamentals from SEC EDGAR...")
     price_close = fetch_prices(ALL_TICKERS)
     fundamentals = fetch_fundamentals(EQUITY_TICKERS, BOND_TICKERS, price_close)
@@ -177,7 +193,7 @@ def main():
     holdout_obs, holdout_reward = obs_df.iloc[split:], reward_df.iloc[split:]
     print(f"   Train: {len(train_obs)} days, Holdout: {len(holdout_obs)} days")
 
-    env = BroadMarketArena(train_obs, train_reward, EQUITY_TICKERS, BOND_TICKERS)
+    env = BroadMarketArena(train_obs, train_reward, EQUITY_TICKERS, BOND_TICKERS, bond_floor=bond_floor)
 
     print("4. Loading/creating model and training...")
     model, continued = load_or_create_model(env)
@@ -185,8 +201,8 @@ def main():
     print("Training complete.")
 
     print("5. Validating on held-out data before saving...")
-    baseline_return = equal_weight_backtest(holdout_reward, ALL_TICKERS, EQUITY_TICKERS, BOND_TICKERS)
-    new_model_return = policy_backtest(model, holdout_obs, holdout_reward, EQUITY_TICKERS, BOND_TICKERS)
+    baseline_return = equal_weight_backtest(holdout_reward, ALL_TICKERS, EQUITY_TICKERS, BOND_TICKERS, floor=bond_floor)
+    new_model_return = policy_backtest(model, holdout_obs, holdout_reward, EQUITY_TICKERS, BOND_TICKERS, floor=bond_floor)
 
     old_model_return = None
     if continued and os.path.exists(METADATA_PATH):
@@ -221,7 +237,11 @@ def main():
 
     equity_idx = list(range(len(EQUITY_TICKERS)))
     bond_idx = list(range(len(EQUITY_TICKERS), len(ALL_TICKERS)))
-    final_weights = apply_bond_floor(raw_weights, equity_idx, bond_idx, BOND_FLOOR)
+    final_weights = apply_bond_floor(raw_weights, equity_idx, bond_idx, bond_floor)
+
+    print("\n6a. Applying strategy review exclusions and tilts (no-op if none are configured)...")
+    final_weights = apply_exclusions(final_weights, equity_idx, EQUITY_TICKERS, settings["excluded_tickers"])
+    final_weights = apply_tilts(final_weights, equity_idx, EQUITY_TICKERS, settings["per_ticker_tilts"])
 
     print("\n6b. Checking recent news sentiment (no-op if no Claude credential is configured)...")
     news_scores = news_sentiment.build_news_scores(EQUITY_TICKERS)
@@ -283,6 +303,7 @@ def main():
         all_tickers=ALL_TICKERS,
         equity_tickers=EQUITY_TICKERS,
         bond_tickers=BOND_TICKERS,
+        strategy_settings=settings,
     )
 
     os.makedirs(REPORTS_DIR, exist_ok=True)

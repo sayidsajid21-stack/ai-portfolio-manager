@@ -101,13 +101,41 @@ def format_orders_section(orders: list, dry_run: bool, alpaca_configured: bool) 
     return mode + "\n\n" + "\n".join(["| Side | Asset | Amount | Status |", "|---|---|---|---|"] + rows)
 
 
+def format_strategy_settings_section(settings: dict) -> str:
+    """`settings` is a strategy_config-shaped dict (equity_share,
+    per_ticker_tilts, excluded_tickers, risk_level), or None if the
+    caller doesn't have strategy settings to report (kept optional so
+    existing callers/tests aren't forced to pass this)."""
+    if not settings:
+        return "_No strategy review settings loaded (using defaults)._"
+
+    lines = [
+        f"- **Equity / bond split**: {settings['equity_share']:.0%} / {1 - settings['equity_share']:.0%}",
+        f"- **Risk level**: {settings['risk_level']}",
+    ]
+    tilts = settings.get("per_ticker_tilts") or {}
+    if tilts:
+        tilt_str = ", ".join(f"{t}: {v:+.1%}" for t, v in tilts.items())
+        lines.append(f"- **Strategic tilts**: {tilt_str}")
+    else:
+        lines.append("- **Strategic tilts**: none")
+
+    excluded = settings.get("excluded_tickers") or []
+    lines.append(f"- **Excluded tickers**: {', '.join(excluded) if excluded else 'none'}")
+
+    return "\n".join(lines)
+
+
 def build_report(report_date, current_weights: dict, previous_weights, news_scores: dict,
                   new_model_return: float, baseline_return: float, old_model_return,
                   orders: list, dry_run: bool, alpaca_configured: bool,
-                  all_tickers, equity_tickers, bond_tickers) -> str:
+                  all_tickers, equity_tickers, bond_tickers, strategy_settings: dict = None) -> str:
     """Assemble the full Markdown report for one monthly run."""
     sections = [
         f"# AI Portfolio Manager — Monthly Report ({report_date})",
+        "",
+        "## Strategy settings in effect",
+        format_strategy_settings_section(strategy_settings),
         "",
         "## Recommended allocation",
         format_weights_table(current_weights, all_tickers, equity_tickers, bond_tickers),
