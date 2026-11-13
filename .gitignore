@@ -1,0 +1,9 @@
+# Model binaries are published as release assets / workflow artifacts,
+# not committed to git (they change daily and bloat repo history).
+graham_value_ai.zip
+*.zip
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
