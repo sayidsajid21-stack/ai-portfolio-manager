@@ -4,3 +4,5 @@ numpy
 gymnasium
 stable-baselines3
 requests
+anthropic
+pydantic

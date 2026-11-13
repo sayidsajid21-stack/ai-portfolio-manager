@@ -48,14 +48,22 @@ jobs:
           # Falls back to a generic placeholder if unset — works, but
           # set your own to follow SEC's guidance.
           EDGAR_USER_AGENT: ${{ vars.EDGAR_USER_AGENT }}
+          # News sentiment scoring (Phase 4) is a no-op unless this is
+          # set. It costs a small amount of real money per run (roughly
+          # one Claude API call per equity with headlines) — set
+          # ANTHROPIC_API_KEY as a repository SECRET (not a variable:
+          # Settings -> Secrets and variables -> Actions -> Secrets) to
+          # enable it. Leave unset to skip the news overlay entirely.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python rebalance.py
 
-      - name: Commit updated metadata (not the model binary)
+      - name: Commit updated metadata and news log (not the model binary)
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add model_metadata.json
-          git commit -m "Monthly model metadata update" || echo "No metadata changes to commit"
+          [ -f news_log.jsonl ] && git add news_log.jsonl
+          git commit -m "Monthly model metadata and news log update" || echo "No metadata changes to commit"
           git push
 
       - name: Upload trained model as a workflow artifact
