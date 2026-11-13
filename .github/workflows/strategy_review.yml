@@ -1,0 +1,72 @@
+name: Strategy Review
+
+# Phase 5: periodically asks Claude to review the strategy's own
+# settings (equity/bond split, per-ticker tilts, excluded tickers, risk
+# level) against recent performance and news, within hard-coded limits
+# enforced in strategy_config.py. It NEVER applies a change directly —
+# if strategy_review.py proposes (and validates) a real change, this
+# workflow opens a pull request for a human to review and merge. The
+# monthly rebalance only picks up a new strategy_settings.json once
+# that PR is merged.
+
+on:
+  # Runs at 9:00 PM UTC on the 15th of every month — partway between
+  # rebalance runs, so there's at least one post-rebalance performance
+  # and news history to review before the next rebalance happens.
+  schedule:
+    - cron: '0 21 15 * *'
+
+  # Manual trigger: click "Run workflow" in the GitHub UI
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  review-strategy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Strategy Review
+        env:
+          # Reuses the same credential as the Phase 4 news overlay. A
+          # no-op (prints a message, changes nothing) if this isn't set.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python strategy_review.py
+
+      - name: Open a pull request if strategy_settings.json changed
+        if: success()
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "Proposed strategy settings update"
+          title: "Strategy review: proposed settings update"
+          body: |
+            Opened automatically by the strategy review agent
+            (strategy_review.py). The proposed settings have already
+            been validated and clipped against the hard limits in
+            strategy_config.py — see strategy_review_log.jsonl's latest
+            entry for the full rationale and any corrections that were
+            applied to the raw proposal.
+
+            **This PR does not take effect until merged.** The next
+            monthly rebalance only reads strategy_settings.json after
+            this is merged into `main`.
+          branch: strategy-review/proposed-update
+          add-paths: |
+            strategy_settings.json
+            strategy_review_log.jsonl
+          delete-branch: true

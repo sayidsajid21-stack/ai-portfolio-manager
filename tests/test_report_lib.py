@@ -1,6 +1,7 @@
 from report_lib import (
     format_weights_table, format_weight_changes, format_news_section,
     format_performance_section, format_orders_section, build_report,
+    format_strategy_settings_section,
 )
 
 
@@ -123,3 +124,41 @@ def test_build_report_includes_all_sections():
     assert "Performance vs. baseline" in report
     assert "Paper trading orders" in report
     assert "AAPL" in report
+
+
+def test_format_strategy_settings_section_handles_none():
+    result = format_strategy_settings_section(None)
+    assert "using defaults" in result.lower()
+
+
+def test_format_strategy_settings_section_shows_tilts_and_exclusions():
+    settings = {
+        "equity_share": 0.70,
+        "per_ticker_tilts": {"AAPL": 0.03, "KO": -0.02},
+        "excluded_tickers": ["XOM"],
+        "risk_level": "conservative",
+    }
+    result = format_strategy_settings_section(settings)
+    assert "70%" in result
+    assert "30%" in result  # bond share = 1 - 0.70
+    assert "conservative" in result
+    assert "AAPL" in result and "+3.0%" in result
+    assert "XOM" in result
+
+
+def test_format_strategy_settings_section_shows_none_for_empty_tilts_and_exclusions():
+    settings = {"equity_share": 0.75, "per_ticker_tilts": {}, "excluded_tickers": [], "risk_level": "balanced"}
+    result = format_strategy_settings_section(settings)
+    assert "none" in result.lower()
+
+
+def test_build_report_includes_strategy_settings_section():
+    report = build_report(
+        report_date="2026-01-01", current_weights={"AAPL": 0.75, "AGG": 0.25}, previous_weights=None,
+        news_scores={}, new_model_return=0.05, baseline_return=0.03, old_model_return=None,
+        orders=[], dry_run=True, alpaca_configured=False,
+        all_tickers=["AAPL", "AGG"], equity_tickers=["AAPL"], bond_tickers=["AGG"],
+        strategy_settings={"equity_share": 0.75, "per_ticker_tilts": {}, "excluded_tickers": [], "risk_level": "balanced"},
+    )
+    assert "Strategy settings in effect" in report
+    assert "balanced" in report
