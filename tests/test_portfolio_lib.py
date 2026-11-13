@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 
 from portfolio_lib import (
-    apply_bond_floor, build_features, make_lagged_observations,
+    apply_bond_floor, apply_news_adjustment, build_features, make_lagged_observations,
     equal_weight_backtest, policy_backtest, MOMENTUM_WINDOWS,
 )
 
@@ -159,3 +159,70 @@ def test_equal_weight_backtest_respects_bond_floor():
     ]
     expected_cumulative = np.prod([1 + r for r in expected_daily]) - 1
     assert result == pytest.approx(expected_cumulative, abs=1e-9)
+
+
+class _FakeNewsScore:
+    """Mimics news_sentiment.NewsScore's relevant attribute without
+    importing pydantic here, to keep this test file's dependencies
+    minimal."""
+    def __init__(self, sentiment):
+        self.sentiment = sentiment
+
+
+def test_apply_news_adjustment_no_change_without_scores():
+    equity_idx = [0, 1]
+    weights = np.array([0.4, 0.4, 0.2])
+    out = apply_news_adjustment(weights, equity_idx, ["AAA", "BBB"], news_sentiments={})
+    np.testing.assert_allclose(out, weights)
+
+
+def test_apply_news_adjustment_boosts_positive_sentiment_ticker():
+    equity_idx = [0, 1]
+    weights = np.array([0.4, 0.4, 0.2])
+    out = apply_news_adjustment(
+        weights, equity_idx, ["AAA", "BBB"],
+        news_sentiments={"AAA": 1.0},  # maximally positive
+        max_adjustment_fraction=0.03,
+    )
+    # AAA's weight should increase relative to BBB's (which got no adjustment).
+    assert out[0] > out[1]
+    # bond weight (index 2) must be completely untouched
+    assert out[2] == pytest.approx(0.2)
+    # total equity weight preserved
+    assert out[0] + out[1] == pytest.approx(0.8, abs=1e-9)
+    # overall weights still sum to 1
+    assert out.sum() == pytest.approx(1.0, abs=1e-9)
+
+
+def test_apply_news_adjustment_penalizes_negative_sentiment_ticker():
+    equity_idx = [0, 1]
+    weights = np.array([0.4, 0.4, 0.2])
+    out = apply_news_adjustment(
+        weights, equity_idx, ["AAA", "BBB"],
+        news_sentiments={"AAA": -1.0},  # maximally negative
+    )
+    assert out[0] < out[1]
+    assert out[2] == pytest.approx(0.2)
+    assert out.sum() == pytest.approx(1.0, abs=1e-9)
+
+
+def test_apply_news_adjustment_accepts_object_with_sentiment_attribute():
+    equity_idx = [0, 1]
+    weights = np.array([0.4, 0.4, 0.2])
+    out_with_object = apply_news_adjustment(
+        weights, equity_idx, ["AAA", "BBB"],
+        news_sentiments={"AAA": _FakeNewsScore(sentiment=0.5)},
+    )
+    out_with_float = apply_news_adjustment(
+        weights, equity_idx, ["AAA", "BBB"],
+        news_sentiments={"AAA": 0.5},
+    )
+    np.testing.assert_allclose(out_with_object, out_with_float)
+
+
+def test_apply_news_adjustment_clips_out_of_range_sentiment():
+    equity_idx = [0, 1]
+    weights = np.array([0.4, 0.4, 0.2])
+    out_clipped = apply_news_adjustment(weights, equity_idx, ["AAA", "BBB"], news_sentiments={"AAA": 5.0})
+    out_max = apply_news_adjustment(weights, equity_idx, ["AAA", "BBB"], news_sentiments={"AAA": 1.0})
+    np.testing.assert_allclose(out_clipped, out_max)

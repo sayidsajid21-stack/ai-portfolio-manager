@@ -32,13 +32,21 @@ short-term noise.
   worth running: trains a fresh model on each rolling window and scores
   it against the baselines on the following held-out window. See
   "Walk-forward backtesting" below.
+- `news_sentiment.py` — scores each equity's recent headlines (free via
+  yfinance) with a Claude API call, used to nudge the final
+  recommendation. See "News sentiment overlay" below.
 - `rebalance.py` — the monthly entry point: fetches data, trains, validates,
-  saves, and prints the recommendation.
+  saves, checks news sentiment, and prints the recommendation.
 - `tests/` — unit tests that run without network access or GPU, using
   synthetic data and a fake SEC response fixture.
 - `model_metadata.json` — small text file tracking when the model was last
   retrained and its holdout backtest score. Committed to git (unlike the
   model binary itself).
+- `news_log.jsonl` — append-only log of every news score ever computed
+  (date, ticker, sentiment, event type, confidence, rationale).
+  Committed to git, so it accumulates a real history over time — useful
+  later even though yfinance's own headline history is too short to
+  backtest against today.
 - `graham_value_ai.zip` — the trained model. **Not committed to git** — it's
   published as a workflow artifact and as an asset on the `latest-model`
   GitHub release, so retraining doesn't bloat repo history with a binary
@@ -121,9 +129,41 @@ save-gate checks).
   the 60/40 baseline on average across folds — a strategy that doesn't
   shouldn't be treated as a real recommendation.
 
+## News sentiment overlay (Phase 4)
+
+`news_sentiment.py` fetches each equity's recent headlines via
+yfinance's free `Ticker.news` (no API key needed) and scores them with
+one Claude API call per ticker (structured JSON output via
+`output_format`, so results are a validated, typed score — not
+free-form text to parse by hand).
+
+- **Why an overlay, not a training feature**: yfinance's free headlines
+  have essentially no history — only a handful of recent articles — so
+  there's no real historical news dataset to train the RL model on yet.
+  Instead, `portfolio_lib.apply_news_adjustment` nudges *today's final
+  recommendation* by up to ±3% per equity's weight (configurable via
+  `news_sentiment.MAX_ADJUSTMENT_FRACTION`), leaving bond weights
+  completely untouched and the equity/bond split exactly as the RL model
+  and `apply_bond_floor` set it.
+- **Cost and setup**: this makes one Claude API call per equity that has
+  headlines that day — roughly $0.10/run at current pricing for 16
+  equities with short headlines, using `claude-opus-5-5`. It is a no-op
+  (nothing is called, nothing changes) unless you set `ANTHROPIC_API_KEY`
+  as a repository **secret** (Settings -> Secrets and variables ->
+  Actions -> **Secrets**, not Variables — this one is sensitive). Leave
+  it unset to skip the overlay entirely and run cost-free as before.
+- **A growing real history**: every score computed is appended to
+  `news_log.jsonl` (date, ticker, sentiment, event type, confidence,
+  rationale) — committed to git each run, so there's a real dataset to
+  eventually backtest the news overlay against, once enough months have
+  accumulated.
+- **Fallback behavior**: a ticker with no headlines that day, or for
+  which scoring fails, is simply omitted from the adjustment (not given
+  a neutral-zero score) — "no news" and "neutral news" are different
+  things, and only the first should leave weights completely alone.
+
 ## Known limitations (tracked, not yet fixed)
 
-- **No news/sentiment input yet** (planned Phase 4).
 - **Recommendations only — no live or paper trading wired up** (planned
   Phase 6, via Alpaca's paper-trading API).
 

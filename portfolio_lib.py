@@ -81,6 +81,52 @@ def apply_bond_floor(raw_weights: np.ndarray, equity_idx, bond_idx, floor: float
     return weights
 
 
+def apply_news_adjustment(weights: np.ndarray, equity_idx, equity_tickers, news_sentiments: dict,
+                           max_adjustment_fraction: float = 0.03) -> np.ndarray:
+    """
+    Nudge equity weights based on a per-ticker news sentiment score in
+    [-1, 1] (see news_sentiment.py), while keeping bond weights exactly
+    unchanged — this runs *after* apply_bond_floor on the final
+    recommendation only, never during RL training (there's no real
+    historical news dataset to train on yet; see news_sentiment.py's
+    docstring).
+
+    `news_sentiments` maps ticker -> a float in [-1, 1] (or any object
+    with a `.sentiment` attribute, e.g. news_sentiment.NewsScore — both
+    are accepted so callers don't have to unwrap it themselves). A
+    ticker missing from this dict gets no adjustment at all, not a
+    neutral-zero adjustment — the two are different: "no news today"
+    should not visibly change weights at all, which a literal zero
+    multiplier would do only by coincidence.
+
+    Each equity's weight is scaled by `(1 + sentiment * max_adjustment_fraction)`,
+    then the whole equity sleeve is renormalized back to its original
+    total (so the equity/bond split from apply_bond_floor is preserved
+    exactly) before being recombined with the unchanged bond weights.
+    """
+    weights = weights.copy()
+    equity_weights = weights[equity_idx]
+    original_equity_total = equity_weights.sum()
+
+    multipliers = np.ones(len(equity_idx))
+    for i, ticker in enumerate(equity_tickers):
+        if ticker not in news_sentiments:
+            continue
+        raw = news_sentiments[ticker]
+        sentiment = getattr(raw, "sentiment", raw)
+        sentiment = float(np.clip(sentiment, -1.0, 1.0))
+        multipliers[i] = 1.0 + sentiment * max_adjustment_fraction
+
+    adjusted = equity_weights * multipliers
+    adjusted_total = adjusted.sum()
+    if adjusted_total > 0:
+        weights[equity_idx] = adjusted * (original_equity_total / adjusted_total)
+    # else: every equity weight was already ~0 (degenerate); leave as-is
+    # rather than divide by zero.
+
+    return weights
+
+
 def softmax_weights(action: np.ndarray) -> np.ndarray:
     exp_action = np.exp(action - np.max(action))
     return exp_action / np.sum(exp_action)

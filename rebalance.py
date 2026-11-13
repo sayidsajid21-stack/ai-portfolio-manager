@@ -26,6 +26,12 @@ Phase 1 addition: equity fundamentals now come from SEC EDGAR's
 point-in-time filing history (edgar_fundamentals.py) instead of a single
 current snapshot broadcast across all history. Set the EDGAR_USER_AGENT
 environment variable to your own contact email — see README.
+
+Phase 4 addition: a news sentiment overlay (news_sentiment.py) nudges
+today's final recommendation — not the RL training data — based on each
+equity's recent headlines (free via yfinance), scored by a Claude API
+call per ticker. This is a no-op unless an Anthropic credential is
+configured (ANTHROPIC_API_KEY) — see README for cost and setup.
 """
 import json
 import os
@@ -39,9 +45,11 @@ from stable_baselines3 import PPO
 from portfolio_lib import (
     ALL_TICKERS, EQUITY_TICKERS, BOND_TICKERS, BOND_FLOOR,
     build_features, make_lagged_observations, BroadMarketArena,
-    apply_bond_floor, softmax_weights, equal_weight_backtest, policy_backtest,
+    apply_bond_floor, apply_news_adjustment, softmax_weights,
+    equal_weight_backtest, policy_backtest,
 )
 import edgar_fundamentals
+import news_sentiment
 
 MODEL_PATH = "graham_value_ai"
 MODEL_FILE = f"{MODEL_PATH}.zip"
@@ -194,6 +202,15 @@ def main():
     equity_idx = list(range(len(EQUITY_TICKERS)))
     bond_idx = list(range(len(EQUITY_TICKERS), len(ALL_TICKERS)))
     final_weights = apply_bond_floor(raw_weights, equity_idx, bond_idx, BOND_FLOOR)
+
+    print("\n6b. Checking recent news sentiment (no-op if no Claude credential is configured)...")
+    news_scores = news_sentiment.build_news_scores(EQUITY_TICKERS)
+    if news_scores:
+        print(f"   Got news scores for: {', '.join(news_scores.keys())}")
+        final_weights = apply_news_adjustment(final_weights, equity_idx, EQUITY_TICKERS, news_scores)
+        news_sentiment.log_news_scores(news_scores)
+    else:
+        print("   No news adjustment applied (no headlines, or no Claude credential configured).")
 
     print(f"\n=== AI PORTFOLIO RECOMMENDATION (as of {obs_df.index[-1].date()}) ===")
     print(f"{'Asset':<10} | {'Type':<10} | {'Weight'}")
