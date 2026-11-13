@@ -1,5 +1,11 @@
 """
-Daily training/allocation run for the AI portfolio manager.
+Monthly training/allocation run for the AI portfolio manager.
+
+This targets long-term investing, not day trading: it's meant to run on a
+monthly cadence (see .github/workflows/monthly_rebalance.yml), using
+longer-horizon momentum features and a turnover penalty (both in
+portfolio_lib.py) that reward the model for holding positions rather than
+trading often.
 
 Fixes applied vs. the original version (see project plan, Phase 0):
   1. No more random fundamentals — real current snapshots from yfinance.
