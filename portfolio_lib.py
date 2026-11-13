@@ -2,7 +2,7 @@
 Core logic for the AI portfolio manager: feature engineering, the trading
 environment, and the shared bond-floor rule.
 
-Kept separate from daily_updater.py so it can be unit-tested without network
+Kept separate from rebalance.py so it can be unit-tested without network
 access or a full PPO training run.
 """
 import numpy as np
@@ -27,6 +27,31 @@ BOND_TICKERS = [
 ALL_TICKERS = EQUITY_TICKERS + BOND_TICKERS
 
 BOND_FLOOR = 0.25  # bonds must be at least this fraction of the portfolio
+
+# This system targets long-term investing, not day trading: it should hold
+# positions and only change them when there's a real reason to, not chase
+# daily noise. TURNOVER_COST_RATE penalizes the model for changing weights
+# day to day (modeling real-world trading costs — spread, slippage, and for
+# a taxable account, short-term capital gains), so the trained policy is
+# rewarded for being patient rather than for trading often. It's expressed
+# in the same reward units as `portfolio_return * 100` in BroadMarketArena —
+# 1.0 total turnover (fully rebalancing the whole portfolio) costs roughly
+# as much reward as a 1% daily move, which is deliberately a strong
+# deterrent against frequent trading.
+TURNOVER_COST_RATE = 1.0
+
+# Trading-day lookback windows for longer-horizon trend features. Day
+# trading cares about yesterday's return; long-term investing cares more
+# about the trend over the last few months.
+MOMENTUM_WINDOWS = {'mom_3m': 63, 'mom_6m': 126}
+
+# A realistic estimate of round-trip trading cost (spread + slippage) as a
+# fraction of the traded amount, used in the backtests below to get a fair
+# after-cost comparison. This is a dollar-cost estimate, unlike
+# TURNOVER_COST_RATE above, which is a training reward-shaping constant,
+# not a cost estimate — the two serve different purposes and are
+# deliberately not the same number.
+TRANSACTION_COST_BPS = 0.0005  # 5 basis points per unit of turnover
 
 
 def apply_bond_floor(raw_weights: np.ndarray, equity_idx, bond_idx, floor: float = BOND_FLOOR) -> np.ndarray:
@@ -69,7 +94,7 @@ def build_features(price_close: pd.DataFrame, fundamentals: dict, all_tickers) -
     one column per ticker in `all_tickers`.
 
     `fundamentals` maps ticker -> dict with keys 'pe', 'p_to_iv', 'div',
-    each a single real snapshot value (see daily_updater.py for how these
+    each a single real snapshot value (see rebalance.py for how these
     are fetched). These are broadcast as constant across all rows because
     yfinance only exposes *current* fundamentals, not a history. This is a
     known simplification — Phase 1 of the project plan replaces it with a
@@ -78,28 +103,34 @@ def build_features(price_close: pd.DataFrame, fundamentals: dict, all_tickers) -
     past date instead of today's value smeared backward.
 
     Returns a DataFrame with columns `{ticker}_ret`, `{ticker}_pe`,
-    `{ticker}_p_to_iv`, `{ticker}_div` for every ticker, aligned on the
-    same index as `price_close.pct_change()` (so the first row, which has
-    no return, is already dropped).
+    `{ticker}_p_to_iv`, `{ticker}_div`, `{ticker}_mom_3m`, `{ticker}_mom_6m`
+    for every ticker. The momentum columns are trailing 3-month and
+    6-month returns (`MOMENTUM_WINDOWS`) — long-term investing cares about
+    the trend over the last few months, not just yesterday's move. Rows
+    near the start of the price history that don't yet have a full
+    6-month lookback are dropped, since those windows would be undefined.
     """
     returns = price_close.pct_change().dropna()
-    n_days = len(returns)
+    momentum = {
+        name: price_close.pct_change(window) for name, window in MOMENTUM_WINDOWS.items()
+    }
 
     feature_dfs = []
     for ticker in all_tickers:
         f = fundamentals.get(ticker, {})
-        pe = np.full(n_days, f.get('pe', 20.0))
-        p_to_iv = np.full(n_days, f.get('p_to_iv', 1.0))
-        div = np.full(n_days, f.get('div', 0.0))
-        ticker_df = pd.DataFrame({
-            f'{ticker}_ret': returns[ticker].values,
-            f'{ticker}_pe': pe,
-            f'{ticker}_p_to_iv': p_to_iv,
-            f'{ticker}_div': div,
-        }, index=returns.index)
-        feature_dfs.append(ticker_df)
+        cols = {
+            f'{ticker}_ret': returns[ticker],
+            f'{ticker}_pe': pd.Series(f.get('pe', 20.0), index=returns.index),
+            f'{ticker}_p_to_iv': pd.Series(f.get('p_to_iv', 1.0), index=returns.index),
+            f'{ticker}_div': pd.Series(f.get('div', 0.0), index=returns.index),
+        }
+        for name in MOMENTUM_WINDOWS:
+            cols[f'{ticker}_{name}'] = momentum[name][ticker]
+        feature_dfs.append(pd.DataFrame(cols))
 
-    return pd.concat(feature_dfs, axis=1)
+    full = pd.concat(feature_dfs, axis=1)
+    # Drop the leading rows where the longest momentum window isn't full yet.
+    return full.dropna()
 
 
 def make_lagged_observations(full_features: pd.DataFrame) -> pd.DataFrame:
@@ -133,10 +164,17 @@ class BroadMarketArena(gym.Env):
     not contain information from the day being traded). `reward_df` gives
     the real returns/fundamentals for that same day, used only to compute
     the reward after the action is taken.
+
+    `turnover_cost_rate` penalizes changing weights day to day (see
+    TURNOVER_COST_RATE), so the trained policy favors holding positions
+    over frequent rebalancing — this system is for long-term investing,
+    not day trading.
     """
 
-    def __init__(self, obs_df: pd.DataFrame, reward_df: pd.DataFrame, equity_tickers, bond_tickers):
+    def __init__(self, obs_df: pd.DataFrame, reward_df: pd.DataFrame, equity_tickers, bond_tickers,
+                 turnover_cost_rate: float = TURNOVER_COST_RATE):
         super().__init__()
+        self.turnover_cost_rate = turnover_cost_rate
         assert len(obs_df) == len(reward_df)
         assert list(obs_df.columns) == list(reward_df.columns)
 
@@ -162,6 +200,7 @@ class BroadMarketArena(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.current_step = 0
+        self.prev_weights = None
         obs = self.obs_data[self.current_step].astype(np.float32)
         return obs, {}
 
@@ -187,7 +226,19 @@ class BroadMarketArena(gym.Env):
                     graham_penalty += ((p_to_iv[i] - 1.0) ** 2) * weight * 0.01
                 dividend_bonus += div_yields[i] * weight * 0.0001
 
-        net_reward = (portfolio_return * 100) - graham_penalty + dividend_bonus
+        # Penalize changing weights from the previous day so the model
+        # favors holding positions over frequent rebalancing (see
+        # TURNOVER_COST_RATE docstring). Turnover is the L1 distance
+        # between today's and yesterday's weights; 2.0 is the max possible
+        # (moving 100% of the portfolio to entirely different assets).
+        if self.prev_weights is None:
+            turnover_cost = 0.0  # first allocation isn't a "change"
+        else:
+            turnover = np.abs(final_weights - self.prev_weights).sum()
+            turnover_cost = turnover * self.turnover_cost_rate
+        self.prev_weights = final_weights
+
+        net_reward = (portfolio_return * 100) - graham_penalty + dividend_bonus - turnover_cost
 
         self.current_step += 1
         done = self.current_step >= self.n_steps - 1
@@ -228,12 +279,19 @@ def equal_weight_backtest(reward_df: pd.DataFrame, all_tickers, equity_tickers, 
     return float(cumulative)
 
 
-def policy_backtest(model, obs_df: pd.DataFrame, reward_df: pd.DataFrame, equity_tickers, bond_tickers, floor: float = BOND_FLOOR) -> float:
+def policy_backtest(model, obs_df: pd.DataFrame, reward_df: pd.DataFrame, equity_tickers, bond_tickers,
+                     floor: float = BOND_FLOOR, transaction_cost_bps: float = TRANSACTION_COST_BPS) -> float:
     """
-    Cumulative return of a trained model's (deterministic) policy over a
-    held-out slice, applying the same bond floor. Used to compare a
-    freshly trained model against both the baseline and the previously
-    saved model before deciding whether to overwrite the saved file.
+    Cumulative, after-cost return of a trained model's (deterministic)
+    policy over a held-out slice, applying the same bond floor. Used to
+    compare a freshly trained model against both the baseline and the
+    previously saved model before deciding whether to overwrite the saved
+    file.
+
+    A realistic trading cost (`transaction_cost_bps` per unit of
+    turnover) is deducted each day the model changes its weights, so a
+    model that trades often doesn't look better than it would in
+    practice — this system targets long-term, low-turnover investing.
     """
     n_equity = len(equity_tickers)
     equity_idx = list(range(n_equity))
@@ -242,11 +300,14 @@ def policy_backtest(model, obs_df: pd.DataFrame, reward_df: pd.DataFrame, equity
     idx_ret = [reward_df.columns.get_loc(f"{t}_ret") for t in all_tickers]
 
     cumulative = 1.0
+    prev_weights = None
     for i in range(len(obs_df)):
         obs = obs_df.iloc[i].values.astype(np.float32)
         action, _ = model.predict(obs, deterministic=True)
         raw_weights = softmax_weights(action)
         weights = apply_bond_floor(raw_weights, equity_idx, bond_idx, floor)
         day_return = reward_df.iloc[i, idx_ret].values @ weights
-        cumulative *= (1 + day_return)
+        cost = 0.0 if prev_weights is None else np.abs(weights - prev_weights).sum() * transaction_cost_bps
+        prev_weights = weights
+        cumulative *= (1 + day_return - cost)
     return float(cumulative - 1)
