@@ -24,6 +24,14 @@ short-term noise.
 - `edgar_fundamentals.py` — fetches point-in-time fundamentals (P/E,
   price-to-book, dividend yield) for equities from SEC EDGAR's free XBRL
   API. See "Point-in-time fundamentals" below.
+- `backtest_lib.py` — performance metrics (CAGR, Sharpe, Sortino, max
+  drawdown, turnover), four static baseline strategies, and walk-forward
+  date splitting. Pure logic, no network calls — unit tested.
+- `walk_forward_backtest.py` — run manually (`python
+  walk_forward_backtest.py`) to check whether the RL model is actually
+  worth running: trains a fresh model on each rolling window and scores
+  it against the baselines on the following held-out window. See
+  "Walk-forward backtesting" below.
 - `rebalance.py` — the monthly entry point: fetches data, trains, validates,
   saves, and prints the recommendation.
 - `tests/` — unit tests that run without network access or GPU, using
@@ -88,14 +96,36 @@ covers), so there's no lookahead.
   yield annualizes the most recently declared quarterly dividend (×4)
   rather than summing the actual trailing four quarters.
 
+## Walk-forward backtesting (Phase 2)
+
+`walk_forward_backtest.py` answers the question the monthly workflow
+doesn't: is this strategy actually any good, over several multi-year
+train/test windows, against real alternatives — not just "did this
+month's model beat last month's model" (which is all `rebalance.py`'s
+save-gate checks).
+
+- **Method**: rolling 3-year train / 1-year test windows
+  (`backtest_lib.walk_forward_splits`), rolled forward a year at a time
+  across the whole price history. A fresh model is trained per fold —
+  this is slow (several PPO training runs), so it's a manual/dev tool,
+  not part of the monthly production workflow.
+- **Baselines**: equal weight, the classic 60/40 equities/bonds split,
+  inverse-volatility (risk parity style), and a simple Graham-style value
+  screen (equal-weight only the equities whose current P/E is below a
+  threshold). All four respect the same 25%-bonds floor the RL model is
+  held to.
+- **Metrics**: CAGR, Sharpe, Sortino (downside-only, which fits a
+  long-term lens better than Sharpe's penalizing-all-volatility), max
+  drawdown, and average daily turnover.
+- **Verdict**: the script's summary states plainly whether the model beat
+  the 60/40 baseline on average across folds — a strategy that doesn't
+  shouldn't be treated as a real recommendation.
+
 ## Known limitations (tracked, not yet fixed)
 
 - **No news/sentiment input yet** (planned Phase 4).
 - **Recommendations only — no live or paper trading wired up** (planned
   Phase 6, via Alpaca's paper-trading API).
-- **No proper walk-forward backtest against baselines yet** beyond the
-  single train/holdout split used to gate whether a freshly trained model
-  replaces the saved one (planned Phase 2).
 
 ## Fixed in this round (Phase 0)
 
