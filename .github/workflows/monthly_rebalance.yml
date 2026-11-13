@@ -1,9 +1,18 @@
-name: Daily AI Portfolio Manager
+name: Monthly AI Portfolio Rebalance
+
+# This system is for long-term investing, not day trading, so it
+# rebalances monthly rather than daily — frequent rebalancing adds
+# trading costs and chases short-term noise instead of long-term trend.
+# Training data, momentum features, and the turnover penalty in
+# portfolio_lib.py are all designed around this cadence.
 
 on:
-  # Runs every weekday at 10:00 PM UTC
+  # Runs at 10:00 PM UTC on the 1st of every month. If the 1st falls on a
+  # weekend/holiday, yfinance simply returns the most recent trading day's
+  # data — there's no need for this to land on an exact trading day for a
+  # monthly-rebalance strategy.
   schedule:
-    - cron: '0 22 * * 1-5'
+    - cron: '0 22 1 * *'
 
   # Manual trigger: click "Run workflow" in the GitHub UI
   workflow_dispatch:
@@ -30,14 +39,14 @@ jobs:
           pip install -r requirements.txt
 
       - name: Execute AI Engine
-        run: python daily_updater.py
+        run: python rebalance.py
 
       - name: Commit updated metadata (not the model binary)
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add model_metadata.json
-          git commit -m "Daily model metadata update" || echo "No metadata changes to commit"
+          git commit -m "Monthly model metadata update" || echo "No metadata changes to commit"
           git push
 
       - name: Upload trained model as a workflow artifact
@@ -53,5 +62,5 @@ jobs:
         with:
           tag_name: latest-model
           name: "Latest trained model"
-          body: "Automatically updated by the daily workflow. See model_metadata.json in the repo for the holdout backtest score that justified this save."
+          body: "Automatically updated by the monthly rebalance workflow. See model_metadata.json in the repo for the holdout backtest score that justified this save."
           files: graham_value_ai.zip

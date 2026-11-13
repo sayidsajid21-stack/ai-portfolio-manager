@@ -4,7 +4,7 @@ import pytest
 
 from portfolio_lib import (
     apply_bond_floor, build_features, make_lagged_observations,
-    equal_weight_backtest,
+    equal_weight_backtest, policy_backtest, MOMENTUM_WINDOWS,
 )
 
 
@@ -48,12 +48,17 @@ def test_weights_always_sum_to_one():
         assert out[bond_idx].sum() >= 0.25 - 1e-6
 
 
-def test_build_features_uses_real_fundamentals_not_random():
-    dates = pd.date_range("2024-01-01", periods=5, freq="D")
-    prices = pd.DataFrame({
-        "AAA": [100, 101, 102, 101, 103],
-        "BBB": [50, 50.5, 50.2, 50.8, 51],
+def _synthetic_prices(n_days=200, seed=0):
+    rng = np.random.default_rng(seed)
+    dates = pd.date_range("2023-01-01", periods=n_days, freq="D")
+    return pd.DataFrame({
+        "AAA": 100 * np.cumprod(1 + rng.normal(0.0003, 0.01, n_days)),
+        "BBB": 50 * np.cumprod(1 + rng.normal(0.0001, 0.005, n_days)),
     }, index=dates)
+
+
+def test_build_features_uses_real_fundamentals_not_random():
+    prices = _synthetic_prices()
     fundamentals = {
         "AAA": {"pe": 18.0, "p_to_iv": 0.9, "div": 0.02},
         "BBB": {"pe": 25.0, "p_to_iv": 1.1, "div": 0.0},
@@ -62,9 +67,27 @@ def test_build_features_uses_real_fundamentals_not_random():
     # fundamentals columns should be exactly the provided constant, not random
     assert (feats["AAA_pe"] == 18.0).all()
     assert (feats["BBB_pe"] == 25.0).all()
-    # returns column should match pct_change of prices
-    expected_ret = prices["AAA"].pct_change().dropna()
-    np.testing.assert_allclose(feats["AAA_ret"].values, expected_ret.values)
+    # returns column should match pct_change of prices, for the rows kept
+    expected_ret = prices["AAA"].pct_change()
+    np.testing.assert_allclose(feats["AAA_ret"].values, expected_ret.loc[feats.index].values)
+
+
+def test_build_features_includes_momentum_and_drops_insufficient_history():
+    prices = _synthetic_prices(n_days=200)
+    fundamentals = {"AAA": {}, "BBB": {}}
+    feats = build_features(prices, fundamentals, ["AAA", "BBB"])
+    # momentum columns exist for every window
+    for name in MOMENTUM_WINDOWS:
+        assert f"AAA_{name}" in feats.columns
+        assert f"BBB_{name}" in feats.columns
+    # the longest lookback window determines how many leading rows are dropped
+    longest = max(MOMENTUM_WINDOWS.values())
+    assert len(feats) == 200 - longest
+    # no NaNs should remain
+    assert not feats.isna().any().any()
+    # momentum values should match a manual pct_change calculation
+    expected_mom_6m = prices["AAA"].pct_change(126)
+    np.testing.assert_allclose(feats["AAA_mom_6m"].values, expected_mom_6m.loc[feats.index].values)
 
 
 def test_lagged_observation_does_not_contain_same_day_return():
