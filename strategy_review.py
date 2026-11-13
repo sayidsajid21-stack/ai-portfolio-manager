@@ -19,6 +19,8 @@ import json
 import os
 from datetime import datetime, timezone
 
+from typing import Dict, List
+
 from pydantic import BaseModel, Field
 
 import strategy_config
@@ -36,13 +38,13 @@ class StrategyProposal(BaseModel):
         description="Proposed fraction of the portfolio in equities (vs. bonds), "
                     "between 0.50 and 0.85. Keep the current value if no change is warranted."
     )
-    per_ticker_tilts: dict = Field(
+    per_ticker_tilts: Dict[str, float] = Field(
         default_factory=dict,
         description="Ticker -> a persistent strategic tilt between -0.05 and 0.05. "
                     "Omit a ticker entirely if it should have no tilt. This is NOT "
                     "for daily news reactions — only for a deliberate, lasting lean."
     )
-    excluded_tickers: list = Field(
+    excluded_tickers: List[str] = Field(
         default_factory=list,
         description="Tickers to exclude entirely from the portfolio (e.g. a serious "
                     "legal, regulatory, or going-concern risk) until this is revisited.",
