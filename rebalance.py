@@ -32,6 +32,14 @@ today's final recommendation — not the RL training data — based on each
 equity's recent headlines (free via yfinance), scored by a Claude API
 call per ticker. This is a no-op unless an Anthropic credential is
 configured (ANTHROPIC_API_KEY) — see README for cost and setup.
+
+Phase 6 addition: after computing the final recommendation, a hard
+10%-per-equity concentration cap (portfolio_lib.cap_single_asset_weight)
+is applied as a last safety check, and the resulting weights can be
+executed as paper trades via Alpaca (alpaca_execution.py) — a no-op
+unless ALPACA_API_KEY/ALPACA_SECRET_KEY are configured. Defaults to a
+dry run (orders are computed and printed but not submitted) unless
+ALPACA_DRY_RUN=false is set explicitly — see README.
 """
 import json
 import os
@@ -45,11 +53,14 @@ from stable_baselines3 import PPO
 from portfolio_lib import (
     ALL_TICKERS, EQUITY_TICKERS, BOND_TICKERS, BOND_FLOOR,
     build_features, make_lagged_observations, BroadMarketArena,
-    apply_bond_floor, apply_news_adjustment, softmax_weights,
-    equal_weight_backtest, policy_backtest,
+    apply_bond_floor, apply_news_adjustment, cap_single_asset_weight,
+    softmax_weights, equal_weight_backtest, policy_backtest,
 )
 import edgar_fundamentals
 import news_sentiment
+import alpaca_execution
+
+MAX_SINGLE_EQUITY_WEIGHT = 0.10
 
 MODEL_PATH = "graham_value_ai"
 MODEL_FILE = f"{MODEL_PATH}.zip"
@@ -212,6 +223,9 @@ def main():
     else:
         print("   No news adjustment applied (no headlines, or no Claude credential configured).")
 
+    print(f"\n6c. Enforcing the {MAX_SINGLE_EQUITY_WEIGHT:.0%} single-equity concentration cap (safety check)...")
+    final_weights = cap_single_asset_weight(final_weights, equity_idx, MAX_SINGLE_EQUITY_WEIGHT)
+
     print(f"\n=== AI PORTFOLIO RECOMMENDATION (as of {obs_df.index[-1].date()}) ===")
     print(f"{'Asset':<10} | {'Type':<10} | {'Weight'}")
     print("-" * 35)
@@ -227,6 +241,15 @@ def main():
     print("-" * 35)
     print(f"TOTAL EQUITY: {total_eq*100:.2f}%")
     print(f"TOTAL BONDS:  {total_bd*100:.2f}%")
+
+    print("\n7. Executing via Alpaca paper trading (no-op if ALPACA_API_KEY/ALPACA_SECRET_KEY are not set)...")
+    if alpaca_execution.is_configured():
+        dry_run = os.environ.get("ALPACA_DRY_RUN", "true").strip().lower() != "false"
+        target_weights = {ticker: float(final_weights[i]) for i, ticker in enumerate(ALL_TICKERS)}
+        orders = alpaca_execution.rebalance_portfolio(target_weights, dry_run=dry_run)
+        alpaca_execution.print_order_report(orders, dry_run)
+    else:
+        print("   Skipped — Alpaca credentials not configured.")
 
 
 if __name__ == "__main__":

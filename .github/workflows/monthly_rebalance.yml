@@ -55,6 +55,19 @@ jobs:
           # Settings -> Secrets and variables -> Actions -> Secrets) to
           # enable it. Leave unset to skip the news overlay entirely.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Paper-trading execution (Phase 6) is a no-op unless both of
+          # these are set as repository SECRETS (Settings -> Secrets and
+          # variables -> Actions -> Secrets). ALPACA_BASE_URL defaults to
+          # the paper-trading endpoint if unset — never point this at the
+          # live-trading endpoint without reading the README's warnings.
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_BASE_URL: ${{ vars.ALPACA_BASE_URL }}
+          # Defaults to "true" (dry run: orders are computed and printed
+          # but never submitted) if unset. Set this repository VARIABLE
+          # to "false" only once you've reviewed several dry-run reports
+          # and are ready for real (paper-money) orders to be submitted.
+          ALPACA_DRY_RUN: ${{ vars.ALPACA_DRY_RUN }}
         run: python rebalance.py
 
       - name: Commit updated metadata and news log (not the model binary)

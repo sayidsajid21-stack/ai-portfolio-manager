@@ -35,8 +35,12 @@ short-term noise.
 - `news_sentiment.py` — scores each equity's recent headlines (free via
   yfinance) with a Claude API call, used to nudge the final
   recommendation. See "News sentiment overlay" below.
+- `alpaca_execution.py` — translates the final recommendation into paper
+  orders via Alpaca's Trading API and (optionally) submits them. See
+  "Paper trading execution" below.
 - `rebalance.py` — the monthly entry point: fetches data, trains, validates,
-  saves, checks news sentiment, and prints the recommendation.
+  saves, checks news sentiment, enforces the concentration cap, and
+  executes (or dry-runs) the paper trade.
 - `tests/` — unit tests that run without network access or GPU, using
   synthetic data and a fake SEC response fixture.
 - `model_metadata.json` — small text file tracking when the model was last
@@ -162,10 +166,56 @@ free-form text to parse by hand).
   a neutral-zero score) — "no news" and "neutral news" are different
   things, and only the first should leave weights completely alone.
 
+## Paper trading execution (Phase 6)
+
+`alpaca_execution.py` turns the final recommendation into orders against
+Alpaca's **paper-trading** API (fake money, not a real brokerage
+account) and, once you opt in, submits them.
+
+- **Setup**: set `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` as repository
+  **secrets** (Settings -> Secrets and variables -> Actions -> Secrets).
+  Both are required — with only one set, execution is skipped entirely.
+- **Defaults to a dry run**: even with credentials configured, orders
+  are computed and printed but **not submitted** unless you also set the
+  repository *variable* `ALPACA_DRY_RUN` to `false`. Review a few
+  monthly dry-run reports before turning this on.
+- **Base URL**: defaults to Alpaca's paper endpoint
+  (`https://paper-api.alpaca.markets/v2`). This is hardcoded as the
+  default specifically so a misconfiguration can't silently point at
+  real-money trading — only an explicit `ALPACA_BASE_URL` repository
+  variable can change it, and you should only ever point it at another
+  paper or sandbox endpoint, never at live trading, without a lot more
+  caution than this project currently has (see the risk-control
+  limitations below).
+- **Safety checks applied before execution**: the bond floor
+  (`apply_bond_floor`, >= 25% bonds, Phase 0) and a hard single-equity
+  concentration cap (`cap_single_asset_weight`, <= 10% per stock, new in
+  this phase) are both enforced on the final weights before they're
+  turned into orders — regardless of what the RL model or the news
+  overlay produced.
+- **Order sizing**: uses Alpaca's notional (dollar-denominated) market
+  orders, diffing target dollar allocations against current position
+  values; diffs below `alpaca_execution.MIN_ORDER_DOLLARS` ($10) are
+  skipped rather than generating trading noise.
+- **Not yet implemented** (see Known limitations): a portfolio-level
+  drawdown circuit breaker, and a cap on total daily turnover across all
+  positions (today's turnover penalty during RL training discourages
+  this but doesn't hard-enforce it at execution time).
+
 ## Known limitations (tracked, not yet fixed)
 
-- **Recommendations only — no live or paper trading wired up** (planned
-  Phase 6, via Alpaca's paper-trading API).
+- **No portfolio-level drawdown circuit breaker.** The original project
+  plan calls for moving to the safest allocation and alerting if the
+  portfolio falls more than a set percentage from its peak — not yet
+  implemented.
+- **No hard cap on total daily turnover across all positions** at
+  execution time (only the RL training reward discourages high
+  turnover; nothing currently blocks a month where many positions all
+  change substantially at once).
+- **Real money is a human decision, not an automatic one.** This project
+  has no path that goes from paper trading to live trading on its own,
+  and shouldn't get one without deliberately choosing to build it after
+  reviewing enough paper-trading history.
 
 ## Fixed in this round (Phase 0)
 
