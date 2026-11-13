@@ -93,14 +93,18 @@ def build_features(price_close: pd.DataFrame, fundamentals: dict, all_tickers) -
     `price_close` is a DataFrame of adjusted close prices indexed by date,
     one column per ticker in `all_tickers`.
 
-    `fundamentals` maps ticker -> dict with keys 'pe', 'p_to_iv', 'div',
-    each a single real snapshot value (see rebalance.py for how these
-    are fetched). These are broadcast as constant across all rows because
-    yfinance only exposes *current* fundamentals, not a history. This is a
-    known simplification — Phase 1 of the project plan replaces it with a
-    real point-in-time fundamentals history from SEC EDGAR so the model
-    sees the P/E and intrinsic-value ratio that actually applied on each
-    past date instead of today's value smeared backward.
+    `fundamentals` maps ticker -> *either*:
+      - a dict with keys 'pe', 'p_to_iv', 'div', each a single constant
+        snapshot value, broadcast across every row (the Phase 0
+        behavior — used when no point-in-time history is available for
+        that ticker, e.g. a bond ETF with no SEC filings); or
+      - a pandas DataFrame with columns 'pe', 'p_to_iv', 'div' indexed by
+        date, giving the real point-in-time value that actually applied
+        on each date (see edgar_fundamentals.py, Phase 1). This is the
+        preferred mode for equities: it replaces today's valuation being
+        smeared backward across the whole training history with the P/E
+        and intrinsic-value ratio that was actually knowable on each past
+        date.
 
     Returns a DataFrame with columns `{ticker}_ret`, `{ticker}_pe`,
     `{ticker}_p_to_iv`, `{ticker}_div`, `{ticker}_mom_3m`, `{ticker}_mom_6m`
@@ -118,11 +122,26 @@ def build_features(price_close: pd.DataFrame, fundamentals: dict, all_tickers) -
     feature_dfs = []
     for ticker in all_tickers:
         f = fundamentals.get(ticker, {})
+        if isinstance(f, pd.DataFrame):
+            # Point-in-time mode: reindex onto the returns index (the
+            # DataFrame may cover a wider date range than the usable
+            # return rows) and forward-fill small gaps from, e.g.,
+            # differing holiday calendars between the fundamentals and
+            # price sources.
+            aligned = f.reindex(returns.index).ffill()
+            pe_col = aligned['pe']
+            p_to_iv_col = aligned['p_to_iv']
+            div_col = aligned['div']
+        else:
+            pe_col = pd.Series(f.get('pe', 20.0), index=returns.index)
+            p_to_iv_col = pd.Series(f.get('p_to_iv', 1.0), index=returns.index)
+            div_col = pd.Series(f.get('div', 0.0), index=returns.index)
+
         cols = {
             f'{ticker}_ret': returns[ticker],
-            f'{ticker}_pe': pd.Series(f.get('pe', 20.0), index=returns.index),
-            f'{ticker}_p_to_iv': pd.Series(f.get('p_to_iv', 1.0), index=returns.index),
-            f'{ticker}_div': pd.Series(f.get('div', 0.0), index=returns.index),
+            f'{ticker}_pe': pe_col,
+            f'{ticker}_p_to_iv': p_to_iv_col,
+            f'{ticker}_div': div_col,
         }
         for name in MOMENTUM_WINDOWS:
             cols[f'{ticker}_{name}'] = momentum[name][ticker]

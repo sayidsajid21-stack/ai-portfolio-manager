@@ -39,6 +39,15 @@ jobs:
           pip install -r requirements.txt
 
       - name: Execute AI Engine
+        env:
+          # SEC EDGAR's Fair Access policy requires a descriptive
+          # User-Agent with a contact email on every request. Set
+          # EDGAR_USER_AGENT as a repository variable (Settings ->
+          # Secrets and variables -> Actions -> Variables) to your own
+          # contact info, e.g. "ai-portfolio-manager you@example.com".
+          # Falls back to a generic placeholder if unset — works, but
+          # set your own to follow SEC's guidance.
+          EDGAR_USER_AGENT: ${{ vars.EDGAR_USER_AGENT }}
         run: python rebalance.py
 
       - name: Commit updated metadata (not the model binary)
