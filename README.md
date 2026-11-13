@@ -7,6 +7,10 @@ monthly rather than daily — trading less often, using multi-month trend
 features, and penalizing unnecessary turnover so it doesn't chase
 short-term noise.
 
+**[Latest monthly report](reports/latest.md)** — positions, what changed
+since last month, news adjustments, performance vs. baseline, and paper
+trading orders.
+
 ## How it runs
 
 - `.github/workflows/monthly_rebalance.yml` runs at 22:00 UTC on the 1st of
@@ -38,11 +42,18 @@ short-term noise.
 - `alpaca_execution.py` — translates the final recommendation into paper
   orders via Alpaca's Trading API and (optionally) submits them. See
   "Paper trading execution" below.
+- `report_lib.py` — builds the Markdown report from structured inputs
+  (weights, news scores, performance, orders). Pure string-building
+  logic, no file I/O — unit tested. See "Monthly reports" below.
 - `rebalance.py` — the monthly entry point: fetches data, trains, validates,
-  saves, checks news sentiment, enforces the concentration cap, and
-  executes (or dry-runs) the paper trade.
+  saves, checks news sentiment, enforces the concentration cap, executes
+  (or dry-runs) the paper trade, and writes the report.
 - `tests/` — unit tests that run without network access or GPU, using
   synthetic data and a fake SEC response fixture.
+- `reports/` — one Markdown report per run (`{date}.md`) plus `latest.md`.
+  Committed to git.
+- `last_recommendation.json` — last month's final weights, used to show
+  what changed in the next report. Committed to git.
 - `model_metadata.json` — small text file tracking when the model was last
   retrained and its holdout backtest score. Committed to git (unlike the
   model binary itself).
@@ -201,6 +212,29 @@ account) and, once you opt in, submits them.
   drawdown circuit breaker, and a cap on total daily turnover across all
   positions (today's turnover penalty during RL training discourages
   this but doesn't hard-enforce it at execution time).
+
+## Monthly reports (Phase 7)
+
+Every run writes a readable Markdown report — no configuration needed,
+this always runs regardless of which other phases are enabled.
+
+- `reports/latest.md` — always the most recent report; linked at the top
+  of this README.
+- `reports/{YYYY-MM-DD}.md` — one dated file per run, so the full history
+  stays browsable in the repo.
+- `last_recommendation.json` — last month's final weights, read back each
+  run so the report can show what changed.
+
+Each report covers:
+1. **Recommended allocation** — the full weights table.
+2. **Changes since last month** — only tickers that moved by more than
+   0.5 percentage points (small rounding drift isn't worth reporting).
+3. **News sentiment adjustments** — which tickers got a news-based nudge
+   and why (empty if Phase 4 isn't configured).
+4. **Performance vs. baseline** — this month's model vs. the equal-weight
+   baseline on held-out data, and whether the model was actually saved.
+5. **Paper trading orders** — what was (or would be) submitted to Alpaca
+   (empty if Phase 6 isn't configured).
 
 ## Known limitations (tracked, not yet fixed)
 

@@ -70,13 +70,13 @@ jobs:
           ALPACA_DRY_RUN: ${{ vars.ALPACA_DRY_RUN }}
         run: python rebalance.py
 
-      - name: Commit updated metadata and news log (not the model binary)
+      - name: Commit updated metadata, news log, and the monthly report (not the model binary)
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add model_metadata.json
+          git add model_metadata.json last_recommendation.json reports/
           [ -f news_log.jsonl ] && git add news_log.jsonl
-          git commit -m "Monthly model metadata and news log update" || echo "No metadata changes to commit"
+          git commit -m "Monthly model metadata, news log, and report update" || echo "No metadata changes to commit"
           git push
 
       - name: Upload trained model as a workflow artifact

@@ -40,6 +40,12 @@ executed as paper trades via Alpaca (alpaca_execution.py) — a no-op
 unless ALPACA_API_KEY/ALPACA_SECRET_KEY are configured. Defaults to a
 dry run (orders are computed and printed but not submitted) unless
 ALPACA_DRY_RUN=false is set explicitly — see README.
+
+Phase 7 addition: a Markdown report (report_lib.py) is written to
+reports/{date}.md and reports/latest.md on every run, covering the
+recommended allocation, what changed since last_recommendation.json's
+saved weights, any news adjustments, performance vs. the baseline, and
+the paper trading orders. No configuration needed — this always runs.
 """
 import json
 import os
@@ -59,12 +65,15 @@ from portfolio_lib import (
 import edgar_fundamentals
 import news_sentiment
 import alpaca_execution
+import report_lib
 
 MAX_SINGLE_EQUITY_WEIGHT = 0.10
 
 MODEL_PATH = "graham_value_ai"
 MODEL_FILE = f"{MODEL_PATH}.zip"
 METADATA_PATH = "model_metadata.json"
+LAST_RECOMMENDATION_PATH = "last_recommendation.json"
+REPORTS_DIR = "reports"
 HOLDOUT_DAYS = 60  # last N days held out to validate before overwriting the saved model
 
 
@@ -243,13 +252,47 @@ def main():
     print(f"TOTAL BONDS:  {total_bd*100:.2f}%")
 
     print("\n7. Executing via Alpaca paper trading (no-op if ALPACA_API_KEY/ALPACA_SECRET_KEY are not set)...")
-    if alpaca_execution.is_configured():
-        dry_run = os.environ.get("ALPACA_DRY_RUN", "true").strip().lower() != "false"
-        target_weights = {ticker: float(final_weights[i]) for i, ticker in enumerate(ALL_TICKERS)}
+    alpaca_configured = alpaca_execution.is_configured()
+    dry_run = os.environ.get("ALPACA_DRY_RUN", "true").strip().lower() != "false"
+    orders = []
+    target_weights = {ticker: float(final_weights[i]) for i, ticker in enumerate(ALL_TICKERS)}
+    if alpaca_configured:
         orders = alpaca_execution.rebalance_portfolio(target_weights, dry_run=dry_run)
         alpaca_execution.print_order_report(orders, dry_run)
     else:
         print("   Skipped — Alpaca credentials not configured.")
+
+    print("\n8. Writing the monthly report...")
+    previous_weights = None
+    if os.path.exists(LAST_RECOMMENDATION_PATH):
+        with open(LAST_RECOMMENDATION_PATH) as f:
+            previous_weights = json.load(f).get("weights")
+
+    report_date = obs_df.index[-1].strftime("%Y-%m-%d")
+    report = report_lib.build_report(
+        report_date=report_date,
+        current_weights=target_weights,
+        previous_weights=previous_weights,
+        news_scores=news_scores,
+        new_model_return=new_model_return,
+        baseline_return=baseline_return,
+        old_model_return=old_model_return,
+        orders=orders,
+        dry_run=dry_run,
+        alpaca_configured=alpaca_configured,
+        all_tickers=ALL_TICKERS,
+        equity_tickers=EQUITY_TICKERS,
+        bond_tickers=BOND_TICKERS,
+    )
+
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    with open(f"{REPORTS_DIR}/{report_date}.md", "w") as f:
+        f.write(report)
+    with open(f"{REPORTS_DIR}/latest.md", "w") as f:
+        f.write(report)
+    with open(LAST_RECOMMENDATION_PATH, "w") as f:
+        json.dump({"date": report_date, "weights": target_weights}, f, indent=2)
+    print(f"   Wrote {REPORTS_DIR}/{report_date}.md and {REPORTS_DIR}/latest.md")
 
 
 if __name__ == "__main__":
