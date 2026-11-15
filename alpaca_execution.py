@@ -36,7 +36,12 @@ def _headers():
 
 
 def _base_url():
-    return os.environ.get("ALPACA_BASE_URL", DEFAULT_BASE_URL)
+    # `or` rather than `.get(..., default)`: an unset GitHub Actions
+    # repository variable arrives as an empty string, not an absent key,
+    # so the dict-default form never falls back — this would otherwise
+    # send every Alpaca request to an empty base URL. Same bug found
+    # live in edgar_fundamentals.py's User-Agent handling.
+    return os.environ.get("ALPACA_BASE_URL") or DEFAULT_BASE_URL
 
 
 def is_configured() -> bool:

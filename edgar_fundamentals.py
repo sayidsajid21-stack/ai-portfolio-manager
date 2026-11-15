@@ -58,7 +58,12 @@ def _get(url, session=None):
     """GET with the required SEC User-Agent header and a light rate limit."""
     import requests
     session = session or requests
-    headers = {"User-Agent": os.environ.get("EDGAR_USER_AGENT", DEFAULT_USER_AGENT)}
+    # `or` rather than `.get(..., default)`: GitHub Actions sets an unset
+    # repository variable as an EMPTY STRING env var, not an absent key,
+    # so the dict-default form never actually falls back — found live,
+    # running this for real: SEC returned 403 for every request because
+    # the User-Agent header was sent as an empty string.
+    headers = {"User-Agent": os.environ.get("EDGAR_USER_AGENT") or DEFAULT_USER_AGENT}
 
     # SEC asks for no more than ~10 requests/second.
     elapsed = time.time() - _last_request_time[0]
