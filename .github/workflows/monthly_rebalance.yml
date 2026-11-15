@@ -74,7 +74,17 @@ jobs:
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add model_metadata.json last_recommendation.json reports/
+          # Each path is guarded and added separately: model_metadata.json
+          # only exists when the model actually beat the baseline this run
+          # (see rebalance.py) and news_log.jsonl only exists once the news
+          # overlay has ever produced a score — a missing optional file
+          # must never abort the whole `git add`, or the files that DO
+          # exist (last_recommendation.json, reports/) silently never get
+          # staged either, since a single `git add` call fails entirely if
+          # any one of its pathspecs doesn't match.
+          [ -f model_metadata.json ] && git add model_metadata.json
+          [ -f last_recommendation.json ] && git add last_recommendation.json
+          [ -d reports ] && git add reports/
           [ -f news_log.jsonl ] && git add news_log.jsonl
           git commit -m "Monthly model metadata, news log, and report update" || echo "No metadata changes to commit"
           git push
